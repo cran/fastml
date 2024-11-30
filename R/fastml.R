@@ -1,330 +1,342 @@
 #' Fast Machine Learning Function
 #'
-#' Trains and evaluates multiple classification models.
+#' Trains and evaluates multiple classification or regression models automatically detecting the task based on the target variable type.
 #'
 #' @param data A data frame containing the features and target variable.
 #' @param label A string specifying the name of the target variable.
-#' @param algorithms A vector of algorithm names to use. Default is \code{c("xgboost", "random_forest", "svm_radial")}.
-#'                   Use \code{"all"} to run all supported algorithms.
+#' @param algorithms A vector of algorithm names to use. Default is \code{"all"} to run all supported algorithms.
 #' @param test_size A numeric value between 0 and 1 indicating the proportion of the data to use for testing. Default is \code{0.2}.
 #' @param resampling_method A string specifying the resampling method for cross-validation. Default is \code{"cv"} (cross-validation).
 #'                          Other options include \code{"none"}, \code{"boot"}, \code{"repeatedcv"}, etc.
-#' @param folds An integer specifying the number of folds for cross-validation. Default is \code{5}.
+#' @param folds An integer specifying the number of folds for cross-validation. Default is \code{10} for methods containing "cv" and \code{25} otherwise.
+#' @param repeats Number of times to repeat cross-validation (only applicable for methods like "repeatedcv").
 #' @param tune_params A list specifying hyperparameter tuning ranges. Default is \code{NULL}.
-#' @param metric The performance metric to optimize during training. Default is \code{"Accuracy"}.
+#' @param metric The performance metric to optimize during training. Default depends on the task.
 #' @param n_cores An integer specifying the number of CPU cores to use for parallel processing. Default is \code{1}.
-#' @param stratify Logical indicating whether to use stratified sampling when splitting the data. Default is \code{TRUE}.
-#' @param impute_method Method for missing value imputation. Default is \code{NULL}.
+#' @param stratify Logical indicating whether to use stratified sampling when splitting the data. Default is \code{TRUE} for classification and \code{FALSE} for regression.
+#' @param impute_method Method for handling missing values. Options include:
+#'   \describe{
+#'     \item{\code{"medianImpute"}}{Impute missing values using median imputation.}
+#'     \item{\code{"knnImpute"}}{Impute missing values using k-nearest neighbors.}
+#'     \item{\code{"bagImpute"}}{Impute missing values using bagging.}
+#'     \item{\code{"remove"}}{Remove rows with missing values from the data.}
+#'     \item{\code{"error"}}{Do not perform imputation; if missing values are detected after preprocessing, stop execution with an error.}
+#'     \item{\code{NULL}}{Equivalent to \code{"error"}. No imputation is performed, and the function will stop if missing values are present.}
+#'   }
+#'   Default is \code{"error"}.
 #' @param encode_categoricals Logical indicating whether to encode categorical variables. Default is \code{TRUE}.
 #' @param scaling_methods Vector of scaling methods to apply. Default is \code{c("center", "scale")}.
 #' @param summaryFunction A custom summary function for model evaluation. Default is \code{NULL}.
+#' @param use_default_tuning Logical indicating whether to use default tuning grids when \code{tune_params} is \code{NULL}. Default is \code{FALSE}.
 #' @param seed An integer value specifying the random seed for reproducibility.
+#' @importFrom magrittr %>%
+#' @importFrom rsample initial_split vfold_cv bootstraps training testing
+#' @importFrom recipes recipe step_impute_median step_impute_knn step_impute_bag step_naomit step_dummy step_center step_scale prep bake
+#' @importFrom dplyr select
+#' @importFrom foreach registerDoSEQ
+#' @importFrom doParallel registerDoParallel
+#' @importFrom parallel stopCluster makeCluster
+#' @importFrom stats as.formula
 #' @return An object of class \code{fastml_model} containing the best model, performance metrics, and other information.
 #' @examples
-#' \donttest{
-#'  # Example 1: Using the iris dataset for binary classification (excluding 'setosa')
-#' data(iris)
-#' iris <- iris[iris$Species != "setosa", ]  # Binary classification
-#' iris$Species <- factor(iris$Species)
+#'   # Example 1: Using the iris dataset for binary classification (excluding 'setosa')
+#'   data(iris)
+#'   iris <- iris[iris$Species != "setosa", ]  # Binary classification
+#'   iris$Species <- factor(iris$Species)
 #'
-#' # Train models
-#' model <- fastml(
-#'   data = iris,
-#'   label = "Species"
-#' )
+#'   # Train models
+#'   model <- fastml(
+#'     data = iris,
+#'     label = "Species",
+#'     algorithms = c("random_forest", "xgboost", "svm_radial")
+#'   )
 #'
-#' # View model summary
-#' summary(model)
-#' }
+#'   # View model summary
+#'   summary(model)
 #'
-#' # Example 2: Using the mtcars dataset for binary classification
-#' data(mtcars)
-#' mtcars$am <- factor(mtcars$am)  # Convert transmission (0 = automatic, 1 = manual) to a factor
+#'   # Example 2: Using the mtcars dataset for regression
+#'   data(mtcars)
 #'
-#' # Train models with a different resampling method and specific algorithms
-#' model2 <- fastml(
-#'   data = mtcars,
-#'   label = "am",
-#'   algorithms = c("random_forest", "svm_radial"),
-#'   resampling_method = "repeatedcv",
-#'   folds = 3,
-#'   test_size = 0.25
-#' )
+#'   # Train models
+#'   model <- fastml(
+#'     data = mtcars,
+#'     label = "mpg",
+#'     algorithms = c("random_forest", "xgboost", "svm_radial")
+#'   )
 #'
-#' # View model performance
-#' summary(model2)
+#'   # View model summary
+#'   summary(model)
 #'
-#' \donttest{
-#' # Example 3: Using the airquality dataset with missing values
-#' data(airquality)
-#' airquality <- na.omit(airquality)  # Simple example to remove missing values for demonstration
-#' airquality$Month <- factor(airquality$Month)
-#'
-#' # Train models with categorical encoding and scaling
-#' model3 <- fastml(
-#'   data = airquality,
-#'   label = "Month",
-#'   encode_categoricals = TRUE,
-#'   scaling_methods = c("center", "scale")
-#' )
-#'
-#' # Evaluate and compare models
-#' summary(model3)
-#' }
-#'
-#' # Example 4: Custom hyperparameter tuning for a random forest
-#' data(iris)
-#' iris <- iris[iris$Species != "setosa", ]  # Filter out 'setosa' for binary classification
-#' iris$Species <- factor(iris$Species)
-#' custom_tuning <- list(
-#'   random_forest = expand.grid(mtry = c(1:10))
-#' )
-#'
-#' model4 <- fastml(
-#'   data = iris,
-#'   label = "Species",
-#'   algorithms = c("random_forest"),
-#'   tune_params = custom_tuning,
-#'   metric = "Accuracy"
-#' )
-#'
-#' # View the results
-#' summary(model4)
-#'
-#' @importFrom caret createDataPartition
-#' @importFrom doParallel registerDoParallel
-#' @importFrom foreach registerDoSEQ
-#' @importFrom parallel makeCluster stopCluster detectCores
 #' @export
 fastml <- function(data,
                    label,
-                   algorithms = c("xgboost", "random_forest", "svm_radial"),
+                   algorithms = "all",
                    test_size = 0.2,
                    resampling_method = "cv",
-                   folds = 5,
+                   folds = ifelse(grepl("cv", resampling_method), 10, 25),
+                   repeats = ifelse(resampling_method == "repeatedcv", 1, NA),
                    tune_params = NULL,
-                   metric = "Accuracy",
+                   metric = NULL,
                    n_cores = 1,
-                   stratify = TRUE,
-                   impute_method = NULL,
+                   stratify = NULL,
+                   impute_method = "error",
                    encode_categoricals = TRUE,
                    scaling_methods = c("center", "scale"),
                    summaryFunction = NULL,
+                   use_default_tuning = FALSE,
                    seed = 123) {
-  # Load required packages
-  if (!requireNamespace("caret", quietly = TRUE)) {
-    stop("The 'caret' package is required but not installed.")
-  }
-  if (!requireNamespace("doParallel", quietly = TRUE)) {
-    stop("The 'doParallel' package is required but not installed.")
-  }
-  if (!requireNamespace("foreach", quietly = TRUE)) {
-    stop("The 'foreach' package is required but not installed.")
-  }
-  if (!requireNamespace("parallel", quietly = TRUE)) {
-    stop("The 'parallel' package is required but not installed.")
-  }
 
-  # Supported metrics
-  supported_metrics <-
-    c("Accuracy",
-      "Kappa",
-      "Sensitivity",
-      "Specificity",
-      "Precision",
-      "F1",
-      "MCC",
-      "ROC")  # Include "ROC"
-
-  # Validate metric (case-insensitive)
-  metric_input <- metric  # Keep the original user input
-  metric_lower <- tolower(metric)
-  supported_metrics_lower <- tolower(supported_metrics)
-  if (!(metric_lower %in% supported_metrics_lower)) {
-    stop(paste(
-      "Unsupported metric. Please choose from:",
-      paste(supported_metrics, collapse = ", ")
-    ))
-  }
-  # Map back to the correctly capitalized metric
-  metric <- supported_metrics[which(supported_metrics_lower == metric_lower)]
-
-  # Check if the label exists in the data
+  # Set random seed
+  set.seed(seed)
+  # Check if label exists in data
   if (!(label %in% names(data))) {
     stop("The specified label does not exist in the data.")
   }
-
+  # Detect task based on target variable type
+  target_var <- data[[label]]
+  if (is.factor(target_var) || is.character(target_var) || is.logical(target_var)) {
+    task <- "classification"
+  } else if (is.numeric(target_var)) {
+    task <- "regression"
+  } else {
+    stop("Unable to detect task type. The target variable must be numeric, factor, character, or logical.")
+  }
+  if (is.null(metric)) {
+    if (task == "classification") {
+      metric <- "accuracy"
+    } else {
+      metric <- "rmse"
+    }
+  }
+  # Set default stratify based on task
+  if (is.null(stratify)) {
+    stratify <- ifelse(task == "classification", TRUE, FALSE)
+  }
   # Handle algorithms
-  supported_algorithms <- c(
+  supported_algorithms_classification <- c(
     "logistic_regression",
     "penalized_logistic_regression",
     "decision_tree",
     "c5.0",
     "random_forest",
     "ranger",
-    "gbm",
     "xgboost",
+    "lightgbm",
     "svm_linear",
     "svm_radial",
     "knn",
     "naive_bayes",
     "neural_network",
+    "deep_learning",
     "lda",
     "qda",
-    "bagging",
-    "adaboost",
-    "logitboost",
-    "elastic_net",
-    "bayes_glm",
-    "pls",
-    "glmboost"
+    "bagging"
   )
-
+  supported_algorithms_regression <- c(
+    "linear_regression",
+    "ridge_regression",
+    "lasso_regression",
+    "elastic_net",
+    "decision_tree",
+    "random_forest",
+    # "gbm",
+    "xgboost",
+    "lightgbm",
+    "svm_linear",
+    "svm_radial",
+    "knn",
+    "neural_network",
+    "deep_learning",
+    "pls",
+    "bayes_glm"
+  )
+  if (task == "classification") {
+    supported_algorithms <- supported_algorithms_classification
+  } else {
+    supported_algorithms <- supported_algorithms_regression
+  }
   if ("all" %in% algorithms) {
     algorithms <- supported_algorithms
   } else {
     invalid_algorithms <- setdiff(algorithms, supported_algorithms)
+    valid_algorithms <- intersect(algorithms, supported_algorithms)
     if (length(invalid_algorithms) > 0) {
       warning(
         paste(
           "Invalid algorithm(s) specified:",
           paste(invalid_algorithms, collapse = ", "),
-          "\nSupported algorithms are:",
+          "\nSupported algorithms for",
+          task,
+          "are:",
           paste(supported_algorithms, collapse = ", ")
         )
       )
-      # Remove invalid algorithms
-      algorithms <- setdiff(algorithms, invalid_algorithms)
+    }
+    if (length(valid_algorithms) == 0) {
+      stop(
+        paste(
+          "No valid algorithms specified. Please choose from the supported algorithms for",
+          task,
+          ":\n",
+          paste(supported_algorithms, collapse = ", ")
+        )
+      )
+    } else {
+      algorithms <- valid_algorithms
     }
   }
-
   # Split data into training and testing sets
-  set.seed(seed)  # For reproducibility
-  if (stratify) {
-    train_index <-
-      createDataPartition(data[[label]], p = 1 - test_size, list = FALSE)
+  if (stratify && task == "classification") {
+    split <- initial_split(data, prop = 1 - test_size, strata = label)
   } else {
-    train_index <-
-      sample(seq_len(nrow(data)), size = floor((1 - test_size) * nrow(data)))
+    split <- initial_split(data, prop = 1 - test_size)
   }
-
-  train_data <- data[train_index, , drop = FALSE]
-  test_data <- data[-train_index, , drop = FALSE]
-
-  # Preprocess data
-  preprocessed <- prepare_data(
-    train_data = train_data,
-    test_data = test_data,
-    label = label,
-    impute_method = impute_method,
-    encode_categoricals = encode_categoricals,
-    scaling_methods = scaling_methods
-  )
-
-  train_processed <- preprocessed$train
-  test_processed <- preprocessed$test
-  preprocessor <- preprocessed$preprocessor
-
-  # Adjust factor levels of the target variable in training data
-  train_processed[[label]] <- as.factor(train_processed[[label]])
-  original_levels <- levels(train_processed[[label]])
-  valid_levels <- make.names(original_levels)
-  if (!all(original_levels == valid_levels)) {
-    levels(train_processed[[label]]) <- valid_levels
-    warning("Factor levels of the target variable have been adjusted to be valid R variable names.")
+  train_data <- training(split)
+  test_data <- testing(split)
+  # Preprocess data using recipes
+  # Create a recipe
+  recipe <- recipe(as.formula(paste(label, "~ .")), data = train_data)
+  # Handle missing values
+  if (impute_method == "medianImpute") {
+    recipe <- recipe %>% step_impute_median(all_numeric_predictors())
+  } else if (impute_method == "knnImpute") {
+    recipe <- recipe %>% step_impute_knn(all_predictors())
+  } else if (impute_method == "bagImpute") {
+    recipe <- recipe %>% step_impute_bag(all_predictors())
+  } else if (impute_method == "remove") {
+    recipe <- recipe %>% step_naomit(all_predictors(), skip = TRUE)
+  } else if (impute_method == "error" || is.null(impute_method)) {
+    # Do nothing, let the recipe throw an error if there are missing values
+  } else {
+    stop("Invalid impute_method specified.")
   }
-
-  # Adjust factor levels of the target variable in test data to match training data
-  test_processed[[label]] <- factor(test_processed[[label]], levels = original_levels)
-  levels(test_processed[[label]]) <- levels(train_processed[[label]])
-
+  # Encode categorical variables
+  if (encode_categoricals) {
+    recipe <- recipe %>% step_dummy(all_nominal_predictors(), -all_outcomes())
+  }
+  # Scaling methods
+  if (!is.null(scaling_methods)) {
+    if ("center" %in% scaling_methods) {
+      recipe <- recipe %>% step_center(all_numeric_predictors())
+    }
+    if ("scale" %in% scaling_methods) {
+      recipe <- recipe %>% step_scale(all_numeric_predictors())
+    }
+  }
+  # Prepare the recipe
+  recipe_prep <- prep(recipe, training = train_data)
+  # Apply the recipe to training and test data
+  train_processed <- bake(recipe_prep, new_data = NULL)
+  test_processed <- bake(recipe_prep, new_data = test_data)
+  # Adjust target variable based on task
+  if (task == "classification") {
+    # Adjust factor levels of the target variable in training data
+    train_processed[[label]] <- as.factor(train_processed[[label]])
+    # Adjust factor levels of the target variable in test data to match training data
+    test_processed[[label]] <- factor(test_processed[[label]], levels = levels(train_processed[[label]]))
+  } else {
+    # For regression, ensure the target variable is numeric
+    train_processed[[label]] <- as.numeric(train_processed[[label]])
+    test_processed[[label]] <- as.numeric(test_processed[[label]])
+  }
   # Check for missing values in preprocessed training data
   if (any(is.na(train_processed))) {
+    # Provide detailed error message
+    na_counts <- colSums(is.na(train_processed))
+    na_vars <- names(na_counts[na_counts > 0])
+    na_info <- paste(na_vars, "(", na_counts[na_vars], " missing)", collapse = ", ")
     stop(
-      "Preprocessed training data contains missing values. Please check the preprocessing steps."
+      paste(
+        "Preprocessed training data contains missing values in the following variables:",
+        na_info,
+        "\nPlease check the preprocessing steps or specify an appropriate 'impute_method'."
+      )
     )
   }
-
-  # Initialize parallel backend if n_cores > 1
+  # Check for missing values in preprocessed test data
+  if (any(is.na(test_processed))) {
+    # Provide detailed error message
+    na_counts <- colSums(is.na(test_processed))
+    na_vars <- names(na_counts[na_counts > 0])
+    na_info <- paste(na_vars, "(", na_counts[na_vars], " missing)", collapse = ", ")
+    stop(
+      paste(
+        "Preprocessed test data contains missing values in the following variables:",
+        na_info,
+        "\nPlease check the preprocessing steps or specify an appropriate 'impute_method'."
+      )
+    )
+  }
+  # Initialize parallel processing if n_cores > 1
   if (n_cores > 1) {
+    if (!requireNamespace("doParallel", quietly = TRUE)) {
+      stop("The 'doParallel' package is required for parallel processing but is not installed.")
+    }
     cl <- makeCluster(n_cores)
     registerDoParallel(cl)
-
-    # Ensure the cluster is stopped even if an error occurs
-    on.exit({
-      stopCluster(cl)
-      registerDoSEQ()
-    }, add = TRUE)
+  } else {
+    registerDoSEQ()
   }
-
-  # Train models within a tryCatch to handle errors and ensure cluster termination
-  models <- tryCatch({
-    train_models(
-      train_data = train_processed,
-      label = label,
-      algorithms = algorithms,
-      resampling_method = resampling_method,
-      folds = folds,
-      tune_params = tune_params,
-      metric = metric,
-      summaryFunction = summaryFunction,
-      seed = seed  # Pass seed for reproducibility
-    )
-  }, error = function(e) {
-    # The on.exit will handle cluster termination
-    stop(e)  # Re-throw the error after ensuring on.exit is called
-  })
-
+  # Train models
+  models <- train_models(
+    train_data = train_processed,
+    label = label,
+    task = task,
+    algorithms = algorithms,
+    resampling_method = resampling_method,
+    folds = folds,
+    repeats = repeats,
+    tune_params = tune_params,
+    metric = metric,
+    summaryFunction = summaryFunction,
+    seed = seed,
+    recipe = recipe,
+    use_default_tuning = use_default_tuning
+  )
+  # Stop parallel processing
+  if (n_cores > 1) {
+    stopCluster(cl)
+  }
   # Check if any models were successfully trained
   if (length(models) == 0) {
     stop("No models were successfully trained. Please check your data and parameters.")
   }
-
-  # Evaluate models (compute multiple metrics by default)
-  performance <-
-    evaluate_models(models, test_processed, label, metric)
-
+  # Evaluate models
+  performance <- evaluate_models(models, train_processed, test_processed, label, task, metric)
   # Calculate best model index using the metric specified
-  metric_values <- sapply(performance, function(x)
-    x[[metric]])
-
+  metric_values <- sapply(performance, function(x) x %>% filter(.metric == metric) %>% pull(.estimate))
   # Handle possible NA values
   if (any(is.na(metric_values))) {
     warning(
       "Some models did not return the specified metric. Check the metric name and model performance."
     )
-    metric_values[is.na(metric_values)] <-
-      -Inf  # Set NA to -Inf so they are not selected as best
+    metric_values[is.na(metric_values)] <- if (task == "regression") Inf else -Inf  # Adjust based on task
   }
-
-  # Check if all metric_values are -Inf (i.e., all models failed to produce the metric)
-  if (all(metric_values == -Inf)) {
+  # Check if all metric_values are Inf or -Inf
+  if (all(metric_values == if (task == "regression") Inf else -Inf)) {
     stop(
       "None of the models returned the specified metric. Please check the 'metric' parameter."
     )
   }
-
-  best_model_idx <- which.max(metric_values)
-
+  # Identify best model
+  if (task == "regression") {
+    best_model_idx <- which.min(metric_values)
+  } else {
+    best_model_idx <- which.max(metric_values)
+  }
+  best_model_name <- names(models)[best_model_idx]
   # Store the result
   result <- list(
     best_model = models[[best_model_idx]],
-    # Best model object
-    best_model_name = names(models)[best_model_idx],
-    # Name of the best algorithm
+    best_model_name = best_model_name,
     performance = performance,
-    # Performance metrics of all models
-    preprocessor = preprocessor,
-    # Preprocessing steps
+    preprocessor = recipe_prep,
     label = label,
-    # Store the label name for future use
+    task = task,
     models = models,
-    # Include all models in the result
-    metric = metric  # Store the optimized metric
-  )
-
+    metric = metric
+   )
   class(result) <- "fastml_model"
-  invisible(result)
+  # Return the result
+  return(result)
 }
-
-

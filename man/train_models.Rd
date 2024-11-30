@@ -7,14 +7,17 @@
 train_models(
   train_data,
   label,
+  task,
   algorithms,
   resampling_method,
   folds,
-  repeats = NULL,
+  repeats,
   tune_params,
   metric,
   summaryFunction = NULL,
-  seed = 123
+  seed = 123,
+  recipe,
+  use_default_tuning = FALSE
 )
 }
 \arguments{
@@ -22,9 +25,11 @@ train_models(
 
 \item{label}{Name of the target variable.}
 
+\item{task}{Type of task: "classification" or "regression".}
+
 \item{algorithms}{Vector of algorithm names to train.}
 
-\item{resampling_method}{Resampling method for cross-validation (e.g., "cv", "repeatedcv").}
+\item{resampling_method}{Resampling method for cross-validation (e.g., "cv", "repeatedcv", "boot", "none").}
 
 \item{folds}{Number of folds for cross-validation.}
 
@@ -37,6 +42,10 @@ train_models(
 \item{summaryFunction}{A custom summary function for model evaluation. Default is \code{NULL}.}
 
 \item{seed}{An integer value specifying the random seed for reproducibility.}
+
+\item{recipe}{A recipe object for preprocessing.}
+
+\item{use_default_tuning}{Logical indicating whether to use default tuning grids when \code{tune_params} is \code{NULL}. Default is \code{FALSE}.}
 }
 \value{
 A list of trained model objects.

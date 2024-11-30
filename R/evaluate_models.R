@@ -3,24 +3,42 @@
 #' Evaluates the trained models on the test data and computes performance metrics.
 #'
 #' @param models A list of trained model objects.
+#' @param train_data Preprocessed training data frame.
 #' @param test_data Preprocessed test data frame.
 #' @param label Name of the target variable.
-#' @param metric The performance metric to optimize (e.g., "Accuracy", "ROC").
+#' @param task Type of task: "classification" or "regression".
+#' @param metric The performance metric to optimize (e.g., "accuracy", "rmse").
+#' @importFrom dplyr filter bind_rows pull mutate select bind_cols
+#' @importFrom yardstick metric_set accuracy kap roc_auc sens spec precision f_meas rmse rsq mae
+#' @importFrom workflows pull_workflow_spec pull_workflow_preprocessor workflow add_model add_recipe
+#' @importFrom parsnip fit predict.model_fit
+#' @importFrom tune select_best finalize_model
+#' @importFrom rlang sym syms
+#' @importFrom tibble tibble
 #' @return A list of performance metrics for each model.
-#'
-#' @importFrom caret confusionMatrix
-#' @importFrom pROC roc
-#' @importFrom stats predict
 #' @export
-evaluate_models <- function(models, test_data, label, metric = "Accuracy") {
+evaluate_models <- function(models, train_data, test_data, label, task, metric = NULL) {
   # Load required packages
-  if (!requireNamespace("caret", quietly = TRUE)) {
-    stop("The 'caret' package is required but not installed.")
+  if (!requireNamespace("yardstick", quietly = TRUE)) {
+    stop("The 'yardstick' package is required but not installed.")
   }
-  if (metric == "ROC") {
-    if (!requireNamespace("pROC", quietly = TRUE)) {
-      stop("The 'pROC' package is required for ROC metric but not installed.")
-    }
+  if (!requireNamespace("parsnip", quietly = TRUE)) {
+    stop("The 'parsnip' package is required but not installed.")
+  }
+  if (!requireNamespace("tune", quietly = TRUE)) {
+    stop("The 'tune' package is required but not installed.")
+  }
+  if (!requireNamespace("workflows", quietly = TRUE)) {
+    stop("The 'workflows' package is required but not installed.")
+  }
+  if (!requireNamespace("dplyr", quietly = TRUE)) {
+    stop("The 'dplyr' package is required but not installed.")
+  }
+  if (!requireNamespace("rlang", quietly = TRUE)) {
+    stop("The 'rlang' package is required but not installed.")
+  }
+  if (!requireNamespace("tibble", quietly = TRUE)) {
+    stop("The 'tibble' package is required but not installed.")
   }
 
   # Initialize performance list
@@ -29,96 +47,125 @@ evaluate_models <- function(models, test_data, label, metric = "Accuracy") {
   # Extract true labels
   true_labels <- test_data[[label]]
 
-  # Remove the label from test_data
-  test_features <- test_data[, !(names(test_data) %in% label), drop = FALSE]
-
-  # Loop over each model
   for (model_name in names(models)) {
     model <- models[[model_name]]
+    metrics_list <- list()
 
-    # Initialize a list to store metrics
-    metrics <- list()
-
-    # Predict on test data
-    predictions <- predict(model, test_features)
-
-    # Compute confusion matrix
-    cm <- confusionMatrix(predictions, true_labels)
-
-    # Extract overall metrics
-    overall_metrics <- cm$overall
-    # Extract per-class metrics
-    class_metrics <- cm$byClass
-
-    # Store overall accuracy and kappa
-    metrics$Accuracy <- overall_metrics['Accuracy']
-    metrics$Kappa <- overall_metrics['Kappa']
-
-    # For multiclass, compute macro-averaged metrics
-    if (nlevels(true_labels) > 2) {
-      # Compute macro-averaged sensitivity (Recall), specificity, precision, and F1 score
-      metrics$Sensitivity <- mean(class_metrics[, 'Sensitivity'], na.rm = TRUE)
-      metrics$Specificity <- mean(class_metrics[, 'Specificity'], na.rm = TRUE)
-      metrics$Precision <- mean(class_metrics[, 'Precision'], na.rm = TRUE)
-      metrics$F1 <- mean(class_metrics[, 'F1'], na.rm = TRUE)
-    } else {
-      # For binary classification, use existing metrics
-      metrics$Sensitivity <- class_metrics['Sensitivity']
-      metrics$Specificity <- class_metrics['Specificity']
-      metrics$Precision <- class_metrics['Precision']
-      metrics$F1 <- class_metrics['F1']
-    }
-
-    # Compute ROC AUC if required
-    if (metric == "ROC") {
-      # Try to get predicted probabilities
-      prob_predictions <- tryCatch({
-        predict(model, test_features, type = "prob")
+    # For regular models
+    if (inherits(model, "tune_results")) {
+      # Finalize the model specification with the best hyperparameters
+      best_params <- tryCatch({
+        select_best(model, metric = metric)
       }, error = function(e) {
-        NULL
+        warning(paste("Could not select best parameters for model", model_name, ":", e$message))
+        return(NULL)
       })
-
-      if (!is.null(prob_predictions)) {
-        # For binary classification
-        if (nlevels(true_labels) == 2) {
-          positive_class <- levels(true_labels)[2]  # Assuming the second level is the positive class
-          roc_obj <- roc(
-            response = true_labels,
-            predictor = prob_predictions[[positive_class]],
-            levels = levels(true_labels),
-            direction = "<"
-          )
-          metrics$ROC <- as.numeric(roc_obj$auc)
-        } else {
-          # For multiclass, compute average ROC AUC using one-vs-all approach
-          roc_list <- list()
-          for (class in levels(true_labels)) {
-            binary_labels <- ifelse(true_labels == class, class, paste0("not_", class))
-            roc_obj <- roc(
-              response = binary_labels,
-              predictor = prob_predictions[[class]],
-              levels = c(class, paste0("not_", class)),
-              direction = "<"
-            )
-            roc_list[[class]] <- as.numeric(roc_obj$auc)
-          }
-          metrics$ROC <- mean(unlist(roc_list), na.rm = TRUE)
-        }
-      } else {
-        warning(
-          paste(
-            "Model",
-            model_name,
-            "does not support probability predictions required for ROC calculation."
-          )
-        )
-        metrics$ROC <- NA
+      if (is.null(best_params)) {
+        next
       }
+
+      # Extract the model specification and recipe from the tuning results
+      model_spec <- pull_workflow_spec(model)
+      model_recipe <- pull_workflow_preprocessor(model)
+
+      # Finalize the model specification with the best parameters
+      final_model_spec <- finalize_model(model_spec, best_params)
+
+      # Create a new workflow with the finalized model specification and the recipe
+      final_workflow <- workflow() %>%
+        add_recipe(model_recipe) %>%
+        add_model(final_model_spec)
+
+      # Fit the final model on the entire training data
+      final_model <- fit(final_workflow, data = train_data)
+    } else {
+      # The model is already a fitted workflow
+      final_model <- model
     }
+
+    # Make predictions on the test data
+    if (task == "classification") {
+      pred_class <- predict(final_model, new_data = test_data, type = "class")$.pred_class
+      pred_prob <- predict(final_model, new_data = test_data, type = "prob")
+      data_metrics <- test_data %>%
+        select(truth = !!sym(label)) %>%
+        mutate(estimate = pred_class) %>%
+        bind_cols(pred_prob)
+
+      # Determine number of classes
+      num_classes <- length(unique(data_metrics$truth))
+      if (num_classes == 2) {
+        # Binary classification
+        positive_class <- levels(data_metrics$truth)[2]
+
+        # Compute metrics
+        metrics_class <- metric_set(
+          accuracy,
+          kap,
+          sens,
+          spec,
+          precision,
+          f_meas
+        )
+        perf_class <- metrics_class(data_metrics, truth = truth, estimate = estimate)
+
+        # Compute ROC AUC
+        roc_auc_value <- roc_auc(
+          data_metrics,
+          truth = truth,
+          !!sym(paste0(".pred_", positive_class)),
+          event_level = "second"
+        )
+
+        # Combine metrics
+        perf <- bind_rows(perf_class, roc_auc_value)
+      } else {
+        # Multiclass classification
+        # Compute metrics with macro averaging
+        metrics_class <- metric_set(
+          accuracy,
+          kap,
+          sens,
+          spec,
+          precision,
+          f_meas
+        )
+        perf_class <- metrics_class(
+          data_metrics,
+          truth = truth,
+          estimate = estimate,
+          estimator = "macro"
+        )
+
+        # Compute ROC AUC with macro averaging
+        prob_cols <- names(pred_prob)
+        perf_roc_auc <- roc_auc(
+          data_metrics,
+          truth = truth,
+          !!!syms(prob_cols),
+          estimator = "macro_weighted"
+        )
+
+        # Combine all metrics
+        perf <- bind_rows(
+          perf_class,
+          perf_roc_auc
+        )
+      }
+    } else {
+      # Regression task
+      predictions <- predict(final_model, new_data = test_data)
+      pred <- predictions$.pred
+      truth <- true_labels
+      data_metrics <- tibble(truth = truth, estimate = pred)
+      # Compute metrics
+      metrics_set <- metric_set(rmse, rsq, mae)
+      perf <- metrics_set(data_metrics, truth = truth, estimate = estimate)
+    }
+    metrics_list <- perf
 
     # Add metrics to performance list
-    performance[[model_name]] <- metrics
+    performance[[model_name]] <- metrics_list
   }
-
   return(performance)
 }
