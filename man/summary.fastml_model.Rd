@@ -2,21 +2,46 @@
 % Please edit documentation in R/summary.fastml_model.R
 \name{summary.fastml_model}
 \alias{summary.fastml_model}
-\title{Summary Function for fastml_model}
+\title{Summary Function for fastml_model (Using yardstick for ROC Curves)}
 \usage{
-\method{summary}{fastml_model}(object, sort_metric = NULL, ...)
+\method{summary}{fastml_model}(
+  object,
+  sort_metric = NULL,
+  plot = TRUE,
+  combined_roc = TRUE,
+  notes = "",
+  ...
+)
 }
 \arguments{
 \item{object}{An object of class \code{fastml_model}.}
 
-\item{sort_metric}{A string specifying which metric to sort the models by.
-Default is \code{NULL}, which prioritizes the optimized metric.}
+\item{sort_metric}{The metric to sort by. Default uses optimized metric.}
 
-\item{...}{Additional arguments (not used).}
+\item{plot}{Logical. If TRUE, produce bar plot, yardstick-based ROC curves (for binary classification),
+confusion matrix (classification), smooth calibration plot (if probabilities),
+and residual plots (regression).}
+
+\item{combined_roc}{Logical. If TRUE, combined ROC plot; else separate ROC plots.}
+
+\item{notes}{User-defined commentary.}
+
+\item{...}{Additional arguments.}
 }
 \value{
-Prints a summary of the models' performances and displays comparison plots.
+Prints summary and plots if requested.
 }
 \description{
-Provides a detailed summary of the models' performances.
+Provides a concise, user-friendly summary of model performances.
+For classification:
+- Shows Accuracy, F1 Score, Kappa, Precision, ROC AUC, Sensitivity, Specificity.
+- Produces a bar plot of these metrics.
+- Shows ROC curves for binary classification using yardstick::roc_curve().
+- Displays a confusion matrix and a calibration plot if probabilities are available.
+}
+\details{
+For regression:
+- Shows RMSE, R-squared, and MAE.
+- Produces a bar plot of these metrics.
+- Displays residual diagnostics (truth vs predicted, residual distribution).
 }
