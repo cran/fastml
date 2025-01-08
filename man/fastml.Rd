@@ -12,10 +12,13 @@ fastml(
   resampling_method = "cv",
   folds = ifelse(grepl("cv", resampling_method), 10, 25),
   repeats = ifelse(resampling_method == "repeatedcv", 1, NA),
+  event_class = "first",
+  exclude = NULL,
+  recipe = NULL,
   tune_params = NULL,
   metric = NULL,
   n_cores = 1,
-  stratify = NULL,
+  stratify = TRUE,
   impute_method = "error",
   encode_categoricals = TRUE,
   scaling_methods = c("center", "scale"),
@@ -25,8 +28,7 @@ fastml(
   tuning_iterations = 10,
   early_stopping = FALSE,
   adaptive = FALSE,
-  seed = 123,
-  recipe = NULL
+  seed = 123
 )
 }
 \arguments{
@@ -45,9 +47,15 @@ Other options include \code{"none"}, \code{"boot"}, \code{"repeatedcv"}, etc.}
 
 \item{repeats}{Number of times to repeat cross-validation (only applicable for methods like "repeatedcv").}
 
+\item{event_class}{A single string. Either "first" or "second" to specify which level of truth to consider as the "event". Default is "first".}
+
+\item{exclude}{A character vector specifying the names of the columns to be excluded from the training process.}
+
+\item{recipe}{A user-defined \code{recipe} object for custom preprocessing. If provided, internal recipe steps (imputation, encoding, scaling) are skipped.}
+
 \item{tune_params}{A list specifying hyperparameter tuning ranges. Default is \code{NULL}.}
 
-\item{metric}{The performance metric to optimize during training. Default depends on the task.}
+\item{metric}{The performance metric to optimize during training.}
 
 \item{n_cores}{An integer specifying the number of CPU cores to use for parallel processing. Default is \code{1}.}
 
@@ -81,8 +89,6 @@ Default is \code{"error"}.}
 \item{adaptive}{Logical indicating whether to use adaptive/racing methods for tuning. Default is \code{FALSE}.}
 
 \item{seed}{An integer value specifying the random seed for reproducibility.}
-
-\item{recipe}{A user-defined \code{recipe} object for custom preprocessing. If provided, internal recipe steps (imputation, encoding, scaling) are skipped.}
 }
 \value{
 An object of class \code{fastml_model} containing the best model, performance metrics, and other information.
@@ -98,12 +104,13 @@ detects the task based on the target variable type and can perform advanced hype
 using various tuning strategies.
 }
 \examples{
+\donttest{
 # Example 1: Using the iris dataset for binary classification (excluding 'setosa')
 data(iris)
 iris <- iris[iris$Species != "setosa", ]  # Binary classification
 iris$Species <- factor(iris$Species)
 
-# Train models with Bayesian optimization
+# Train models
 model <- fastml(
   data = iris,
   label = "Species",
@@ -125,5 +132,7 @@ summary(model)
 
   # View model summary
   summary(model)
+
+  }
 
 }

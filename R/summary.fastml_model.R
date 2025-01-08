@@ -1,4 +1,4 @@
-utils::globalVariables(c("truth", "residual", "sensitivity", "specificity"))
+utils::globalVariables(c("truth", "residual", "sensitivity", "specificity", "FalsePositiveRate", "TruePositiveRate"))
 
 #' Summary Function for fastml_model (Using yardstick for ROC Curves)
 #'
@@ -16,6 +16,7 @@ utils::globalVariables(c("truth", "residual", "sensitivity", "specificity"))
 #'
 #'
 #' @param object An object of class \code{fastml_model}.
+#' @param algorithm A vector of algorithm names to display summary. Default is \code{"best"}.
 #' @param sort_metric The metric to sort by. Default uses optimized metric.
 #' @param plot Logical. If TRUE, produce bar plot, yardstick-based ROC curves (for binary classification),
 #'   confusion matrix (classification), smooth calibration plot (if probabilities),
@@ -29,15 +30,17 @@ utils::globalVariables(c("truth", "residual", "sensitivity", "specificity"))
 #' @importFrom magrittr %>%
 #' @importFrom reshape2 melt dcast
 #' @importFrom tune extract_fit_parsnip
-#' @importFrom ggplot2 ggplot aes geom_bar geom_path facet_wrap theme_bw theme element_text labs geom_point geom_line geom_histogram geom_abline coord_equal scale_color_manual
+#' @importFrom ggplot2 ggplot aes geom_bar geom_path facet_wrap theme_bw theme element_text labs geom_point geom_line geom_histogram geom_abline coord_equal scale_color_manual theme_minimal element_blank ylim
 #' @importFrom RColorBrewer brewer.pal
-#' @importFrom yardstick conf_mat roc_curve
+#' @importFrom yardstick conf_mat
+#' @importFrom pROC roc auc
 #' @importFrom probably cal_plot_breaks
 #' @importFrom rlang get_expr get_env sym
 #' @importFrom viridisLite viridis
 #'
 #' @export
 summary.fastml_model <- function(object,
+                                 algorithm = "best",
                                  sort_metric = NULL,
                                  plot = TRUE,
                                  combined_roc = TRUE,
@@ -53,6 +56,7 @@ summary.fastml_model <- function(object,
   best_model_name <- object$best_model_name
   optimized_metric <- object$metric
   model_count <- length(object$models)
+  positive_class <- object$positive_class
 
   # Combine performance metrics
   metrics_list <- lapply(names(performance), function(mn) {
@@ -88,7 +92,7 @@ summary.fastml_model <- function(object,
   performance_sub <- performance_df[performance_df$.metric %in% desired_metrics, ]
   performance_wide <- dcast(performance_sub, Model ~ .metric, value.var = ".estimate")
 
-  if (task == "regression") {
+  if (task == "regression" && main_metric != "rsq") {
     performance_wide <- performance_wide[order(performance_wide[[main_metric]], na.last = TRUE), ]
   } else {
     performance_wide <- performance_wide[order(-performance_wide[[main_metric]], na.last = TRUE), ]
@@ -110,16 +114,36 @@ summary.fastml_model <- function(object,
   cat("\n===== fastml Model Summary =====\n")
   cat("Task:", task, "\n")
   cat("Number of Models Trained:", model_count, "\n")
-  best_val <- performance_wide[performance_wide$Model == best_model_name, main_metric]
-  cat("Best Model:", best_model_name, sprintf("(%s: %.3f)", main_metric, best_val), "\n\n")
+  best_val <- unique(performance_wide[performance_wide$Model %in% best_model_name, main_metric])
+  cat("Best Model(s):", best_model_name, sprintf("(%s: %.7f)", main_metric, best_val), "\n\n")
 
   cat("Performance Metrics (Sorted by", main_metric, "):\n\n")
 
   metrics_to_print <- c("Model", desired_metrics)
-  best_idx <- which(performance_wide$Model == best_model_name)
+
+  best_model_idx <- which(performance_wide$Model %in% best_model_name)
+
+
+  if(length(algorithm) == 1 && algorithm == "best"){
+    selected_model_idx <- best_model_idx
+    desired_models <- object$best_model
+  }else{
+
+    if(all(algorithm %in% names(object$models))){
+
+      selected_model_idx <- which(performance_wide$Model %in% algorithm)
+      desired_models <- object$models[algorithm]
+
+    }else{
+
+      stop("Not all specified algorithms entered correctly.")
+    }
+  }
+
+  desired_model_name <- names(desired_models)
 
   for (m in desired_metrics) {
-    performance_wide[[m]] <- format(performance_wide[[m]], digits = 3, nsmall = 3)
+    performance_wide[[m]] <- format(performance_wide[[m]], digits = 7, nsmall = 7)
   }
 
   header <- c("Model", sapply(desired_metrics, function(m) {
@@ -128,7 +152,7 @@ summary.fastml_model <- function(object,
 
   data_str <- performance_wide
   data_str$Model <- as.character(data_str$Model)
-  if (length(best_idx) == 1) data_str$Model[best_idx] <- paste0(data_str$Model[best_idx], "*")
+  data_str$Model[best_model_idx] <- paste0(data_str$Model[best_model_idx], "*")
 
   col_widths <- sapply(seq_along(header), function(i) {
     col_name <- header[i]
@@ -151,30 +175,111 @@ summary.fastml_model <- function(object,
   }
 
   cat(line_sep, "\n")
-  cat("(* Best model)\n\n")
+  cat("(*Best model)\n\n")
 
-  cat("Best Model Hyperparameters:\n\n")
-  parsnip_fit <- tryCatch(extract_fit_parsnip(object$best_model), error = function(e) NULL)
+
+  if(length(algorithm) == 1 && algorithm == "best"){
+    cat("Best Model Hyperparameters:\n\n")
+
+  }else{
+
+    cat("Selected Model Hyperparameters:\n\n")
+
+  }
+
+  if(length(desired_models) == 1){
+    parsnip_fit <- tryCatch(extract_fit_parsnip(desired_models[[1]]), error = function(e) NULL)
+    nms_parsnip_fit <- names(parsnip_fit)
+    nms_parsnip_spec <- names(parsnip_fit$spec)
+  } else {
+    parsnip_fit <- tryCatch(lapply(desired_models, extract_fit_parsnip), error = function(e) NULL)
+    nms_parsnip_fit <- unique(unlist(lapply(parsnip_fit, names)))
+    nms_parsnip_spec <- unique(unlist(lapply(lapply(parsnip_fit, function(model) model$spec), names)))
+  }
+
   if (is.null(parsnip_fit)) {
     cat("Could not extract final fitted model details.\n")
-  } else if ("spec" %in% names(parsnip_fit) && "args" %in% names(parsnip_fit$spec)) {
-    params <- parsnip_fit$spec$args
+  } else if ("spec" %in% nms_parsnip_fit && "args" %in% nms_parsnip_spec) {
+
+    if(length(desired_models) == 1){
+      params <- parsnip_fit$spec$args
+    }else{
+      params <- lapply(parsnip_fit, function(model) model$spec$args)
+    }
     if (length(params) > 0) {
       cleaned_params <- list()
-      for (pname in names(params)) {
+      if(length(desired_models) == 1){
+          for (pname in names(params)) {
         val <- params[[pname]]
         if (inherits(val, "quosure")) {
           val <- tryCatch(eval(get_expr(val), envir = get_env(val)), error = function(e) val)
         }
         cleaned_params[[pname]] <- val
       }
+      }else{
+
+        # Initialize a list to store cleaned parameters for each model
+        cleaned_params_list <- list()
+
+        # Process each model's parameters
+        for (model_name in names(params)) {
+          model_params <- params[[model_name]]
+          cleaned_params <- list()
+
+          for (pname in names(model_params)) {
+            val <- model_params[[pname]]
+
+            # Check if the parameter is a quosure
+            if (inherits(val, "quosure")) {
+              val <- tryCatch(
+                eval(rlang::get_expr(val), envir = rlang::get_env(val)),
+                error = function(e) val # Retain the quosure if evaluation fails
+              )
+            }
+
+            # Add the cleaned value to the cleaned_params list
+            cleaned_params[[pname]] <- val
+          }
+
+          # Store the cleaned parameters for the current model
+          cleaned_params_list[[model_name]] <- cleaned_params
+        }
+
+      }
       if (length(cleaned_params) == 0) {
         cat("No hyperparameters found.\n")
       } else {
-        for (pname in names(cleaned_params)) {
-          val <- cleaned_params[[pname]]
-          if (is.numeric(val)) val <- as.character(val)
-          cat(pname, ": ", val, "\n", sep = "")
+
+        if(length(desired_models) == 1){
+          cat("Model:", desired_model_name, "\n")
+          for (pname in names(cleaned_params)) {
+            val <- cleaned_params[[pname]]
+            if (is.numeric(val)) val <- as.character(val)
+            cat("  ", pname, ": ", rlang::eval_tidy(val), "\n", sep = "")
+          }
+        }else{
+
+          # Loop through the cleaned parameters for each model
+          for (model_name in names(cleaned_params_list)) {
+            cat("Model:", model_name, "\n")
+
+            # Extract cleaned parameters for the current model
+            cleaned_params <- cleaned_params_list[[model_name]]
+
+            # Process and print each parameter
+            for (pname in names(cleaned_params)) {
+              val <- cleaned_params[[pname]]
+
+              # Convert numeric values to character for consistent output
+              if (is.numeric(val)) val <- as.character(val)
+
+              # Print parameter name and value
+              cat("  ", pname, ": ", val, "\n", sep = "")
+            }
+
+            # Add a separator for readability between models
+            cat("\n")
+          }
         }
       }
     } else {
@@ -226,7 +331,13 @@ summary.fastml_model <- function(object,
     ) +
     labs(title = "Model Performance Comparison", x = "Model", y = "Metric Value")
 
+  # Adjust y-axis limits if it's a classification task
+  if (task == "classification") {
+    p_bar <- p_bar + ylim(0, 1)
+  }
+
   print(p_bar)
+
 
   # ROC curves for binary classification using yardstick
   if (task == "classification" && !is.null(predictions_list) && length(predictions_list) > 0) {
@@ -237,57 +348,88 @@ summary.fastml_model <- function(object,
       if (!is.null(df_example) && "truth" %in% names(df_example)) {
         unique_classes <- unique(df_example$truth)
         if (length(unique_classes) == 2) {
-          positive_class <- levels(df_example$truth)[1]
-
           # We'll create a combined data frame for ROC curves from all models
-          roc_dfs <- list()
+          dfs = list()
           for (model_name in model_names_pred) {
             df <- predictions_list[[model_name]]
             prob_cols <- grep("^\\.pred_", names(df), value = TRUE)
             if (length(prob_cols) == 2) {
               pred_col <- paste0(".pred_", positive_class)
               if (pred_col %in% prob_cols) {
-                roc_df <- roc_curve(df, truth, !!sym(pred_col))
-                roc_df$Model <- model_name
-                roc_dfs[[model_name]] <- roc_df
+                df$Model <- model_name
+                dfs[[model_name]] <- df
               }
             }
           }
 
-          if (length(roc_dfs) > 0) {
-            all_roc <- bind_rows(roc_dfs)
+          if (length(dfs) > 0) {
+            dfs_roc <- bind_rows(dfs)
 
-            num_curves <- length(roc_dfs)
-            if (num_curves > 1) {
-              # Generate a sequence of pretty colors with viridis
-              colors <- viridis(num_curves)
-            } else {
-              # If there's only one curve, just use black or any single color
-              colors <- "#000000"
+            # Convert 'truth' and 'Model' to factors if they aren't already
+            dfs_roc$truth <- factor(dfs_roc$truth)
+            dfs_roc$Model <- as.factor(dfs_roc$Model)
+
+            # Get the list of unique models
+            models <- levels(dfs_roc$Model)
+
+            # Initialize an empty list to store ROC objects
+            roc_list <- list()
+            pred_col <- paste0(".pred_", positive_class)
+
+
+            # Compute ROC curves for each model
+            for (model in models) {
+              # Subset data for the current model
+              data_model <- subset(dfs_roc, Model == model)
+
+              # Compute ROC using .pred_1 as the predictor
+              roc_obj <- roc(response = data_model$truth,
+                             predictor = data_model[[pred_col]],
+                             direction = "auto",
+                             quiet = TRUE)  # Suppress messages
+
+              # Store the ROC object in the list
+              roc_list[[model]] <- roc_obj
             }
-            if (combined_roc) {
-              p_roc <- ggplot(all_roc, aes(x = 1 - specificity, y = sensitivity, color = Model)) +
-                geom_path() +
-                geom_abline(lty = 3) +
-                coord_equal() +
-                theme_bw() +
-                labs(title = "Combined ROC Curves for All Models") +
-                scale_color_manual(values = colors)
-              print(p_roc)
-            } else {
-              # Separate plots for each model
-              # We'll just facet by Model
-              p_roc_sep <- ggplot(all_roc, aes(x = 1 - specificity, y = sensitivity, color = Model)) +
-                geom_path() +
-                geom_abline(lty = 3) +
-                coord_equal() +
-                facet_wrap(~ Model) +
-                theme_bw() +
-                labs(title = "ROC Curves by Model") +
-                scale_color_manual(values = colors) +
-                theme(legend.position = "none")
-              print(p_roc_sep)
+
+
+            # Compute AUC values for each model
+            auc_values <- sapply(roc_list, function(x) auc(x))
+
+            # Sort models by AUC values in descending order
+            sorted_models <- names(sort(auc_values, decreasing = TRUE))
+
+            # Reorder roc_data and update the legend
+            roc_data <- data.frame()
+            for (model in sorted_models) {
+              roc_obj <- roc_list[[model]]
+              roc_df <- data.frame(
+                FalsePositiveRate = rev(roc_obj$specificities),
+                TruePositiveRate = rev(roc_obj$sensitivities),
+                Model = model
+              )
+              roc_data <- rbind(roc_data, roc_df)
             }
+
+            # Create the ggplot
+            roc_curve_plot <- ggplot(data = roc_data, aes(x = 1 - FalsePositiveRate, y = TruePositiveRate, color = Model)) +
+              geom_line(linewidth = 1) +
+              geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey") +
+              theme_minimal() +
+              labs(title = "ROC Curves for Models",
+                   x = "1 - Specificity",
+                   y = "Sensitivity") +
+              theme(plot.title = element_text(hjust = 0.5)) +
+              # Optionally add AUC to the legend, sorted by AUC
+              scale_color_manual(values = 1:length(sorted_models),
+                                 labels = paste0(sorted_models, " (AUC = ",
+                                                 sprintf("%.3f", auc_values[sorted_models]), ")")) +
+              theme(legend.title = element_blank())
+
+            print(roc_curve_plot)
+
+
+
           } else {
             cat("\nNo suitable probability predictions for ROC curves.\n")
           }
@@ -304,24 +446,92 @@ summary.fastml_model <- function(object,
   }
 
   # Additional Diagnostics
-  if (plot && !is.null(predictions_list) && best_model_name %in% names(predictions_list)) {
-    df_best <- predictions_list[[best_model_name]]
+  if (plot && !is.null(predictions_list) && all(desired_model_name %in% names(predictions_list))) {
+
+    if(length(desired_models) == 1){
+      df_best <- predictions_list[[desired_model_name]]
+      names_df_best <- names(df_best)
+    }else{
+      df_best <- predictions_list[desired_model_name]
+      names_df_best <- unique(unlist(lapply(df_best, names)))
+      }
+
     if (task == "classification") {
-      if (!is.null(df_best) && "truth" %in% names(df_best) && "estimate" %in% names(df_best)) {
-        cm <- conf_mat(df_best, truth = truth, estimate = estimate)
-        cat("\nConfusion Matrix for Best Model:\n")
-        print(cm)
+      if (!is.null(df_best) && "truth" %in% names_df_best && "estimate" %in% names_df_best) {
+        if(length(desired_models) == 1){
+          cm <- conf_mat(df_best, truth = truth, estimate = estimate)
+          cat("\nConfusion Matrix for",desired_model_name, "\n")
+          print(cm)
+        }else{
+
+          # Iterate through the models in df_best
+          for (model_name in names(df_best)) {
+            cat("Confusion Matrix for", model_name, "\n")
+
+            # Extract predictions for the current model
+            model_predictions <- df_best[[model_name]]
+
+            # Check if `truth` and `estimate` columns are available
+            if (!("truth" %in% colnames(model_predictions)) || !("estimate" %in% colnames(model_predictions))) {
+              cat("Error: Missing `truth` or `estimate` columns in predictions for model:", model_name, "\n")
+              next
+            }
+
+            # Compute confusion matrix
+            cm <- conf_mat(model_predictions, truth = truth, estimate = estimate)
+            print(cm)
+          }
+        }
 
         # Calibration Plot
         if (requireNamespace("probably", quietly = TRUE)) {
+          if(length(desired_models) == 1){
           prob_cols <- grep("^\\.pred_", names(df_best), value = TRUE)
+
+          }else{
+
+            prob_cols <- grep("^\\.pred_", names_df_best, value = TRUE)
+
+          }
           if (length(prob_cols) > 1) {
-            positive_class <- levels(df_best$truth)[1]
             pred_col <- paste0(".pred_", positive_class)
             if (pred_col %in% prob_cols) {
-              p_cal <- cal_plot_breaks(df_best, truth = truth, estimate = !!sym(pred_col)) +
-                labs(title = "Calibration Plot")
+
+              if(length(desired_models) == 1){
+                p_cal <- cal_plot_breaks(
+                  df_best,
+                  truth = truth,
+                  estimate = !!sym(pred_col),
+                  event_level = object$event_class
+                ) +
+                  labs(title = paste("Calibration Plot", desired_model_name))
               print(p_cal)
+              }else{
+
+                # Loop through each model in df_best
+                for (model_name in names(df_best)) {
+
+                  # Extract the predictions for the current model
+                  model_predictions <- df_best[[model_name]]
+
+                  # Ensure the pred_col exists in the data frame
+                  if (!pred_col %in% colnames(model_predictions)) {
+                    cat("Error: Column", pred_col, "not found in model predictions for", model_name, "\n")
+                    next
+                  }
+
+                  # Create the calibration plot
+                  p_cal <- cal_plot_breaks(
+                    model_predictions,
+                    truth = truth,
+                    estimate = !!sym(pred_col),
+                    event_level = object$event_class
+                  ) +
+                    labs(title = paste("Calibration Plot for", model_name))
+
+                  print(p_cal)
+                }
+              }
             }
           }
         } else {
