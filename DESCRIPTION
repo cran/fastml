@@ -1,7 +1,8 @@
 Package: fastml
 Type: Package
 Title: Fast Machine Learning Model Training and Evaluation
-Version: 0.4.0
+Version: 0.5.0
+Date: 2025-03-07
 Authors@R: c(person("Selcuk", "Korkmaz", email="selcukorkmaz@gmail.com", role=c("aut", "cre"),
                     comment = c(ORCID = "0000-0003-4632-6850")), 
              person("Dincer", "Goksuluk", email="dincer.goksuluk@gmail.com", role="aut",
@@ -19,16 +20,17 @@ Imports: recipes, dplyr, ggplot2, reshape2, rsample, parsnip, tune,
         probably, viridisLite, DALEX, magrittr, patchwork, pROC,
         janitor, stringr, DT, GGally, UpSetR, VIM, broom, dbscan,
         ggpubr, gridExtra, htmlwidgets, kableExtra, moments, naniar,
-        plotly, scales, skimr, tidyr, knitr, rmarkdown,
+        plotly, scales, skimr, tidyr, knitr, rmarkdown, purrr, mice,
+        missForest
 Suggests: testthat (>= 3.0.0), C50, glmnet, xgboost, ranger, crayon,
         kernlab, klaR, kknn, keras, lightgbm, rstanarm, mixOmics,
 RoxygenNote: 7.3.2
 Config/testthat/edition: 3
 NeedsCompilation: no
-Packaged: 2025-01-08 07:50:45 UTC; selcukkorkmaz
+Packaged: 2025-03-07 11:26:39 UTC; selcuk
 Author: Selcuk Korkmaz [aut, cre] (<https://orcid.org/0000-0003-4632-6850>),
   Dincer Goksuluk [aut] (<https://orcid.org/0000-0002-2752-7668>),
   Eda Karaismailoglu [aut] (<https://orcid.org/0000-0003-3085-7809>)
 Maintainer: Selcuk Korkmaz <selcukorkmaz@gmail.com>
 Repository: CRAN
-Date/Publication: 2025-01-08 08:10:05 UTC
+Date/Publication: 2025-03-07 11:50:11 UTC
