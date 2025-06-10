@@ -808,7 +808,6 @@ get_default_tune_params <- function(algo, train_data, label, engine) {
          NULL)
 }
 
-utils::globalVariables(c("metric", "train_data", "true_labels"))
 #' Process Model and Compute Performance Metrics
 #'
 #' Finalizes a tuning result or utilizes an already fitted workflow to generate predictions on test data and compute performance metrics.
@@ -820,6 +819,8 @@ utils::globalVariables(c("metric", "train_data", "true_labels"))
 #' @param label A character string specifying the name of the outcome variable in \code{test_data}.
 #' @param event_class For classification tasks, a character string specifying which event class to consider as positive (accepted values: \code{"first"} or \code{"second"}).
 #' @param engine A character string specifying the modeling engine used. This parameter affects prediction types and metric computations.
+#' @param train_data A data frame containing the training data used to fit tuned models.
+#' @param metric A character string specifying the metric name used to select the best tuning parameters.
 #'
 #' @return A list with two components:
 #'   \describe{
@@ -832,7 +833,7 @@ utils::globalVariables(c("metric", "train_data", "true_labels"))
 #'     \item Select the best tuning parameters using \code{tune::select_best} (note that the metric used for selection should be defined in the calling environment).
 #'     \item Extract the model specification and preprocessor from \code{model_obj} using \code{workflows::pull_workflow_spec} and \code{workflows::pull_workflow_preprocessor}, respectively.
 #'     \item Finalize the model specification with the selected parameters via \code{tune::finalize_model}.
-#'     \item Rebuild the workflow using \code{workflows::workflow}, \code{workflows::add_recipe}, and \code{workflows::add_model}, and fit the finalized workflow with \code{parsnip::fit} on training data (the variable \code{train_data} is expected to be available in the environment).
+#'     \item Rebuild the workflow using \code{workflows::workflow}, \code{workflows::add_recipe}, and \code{workflows::add_model}, and fit the finalized workflow with \code{parsnip::fit} on the supplied \code{train_data}.
 #'   }
 #'   If \code{model_obj} is already a fitted workflow, it is used directly.
 #'
@@ -849,10 +850,12 @@ utils::globalVariables(c("metric", "train_data", "true_labels"))
 #' @importFrom yardstick metric_set accuracy kap sens spec precision f_meas roc_auc rmse rsq mae
 #' @importFrom tibble tibble
 #' @importFrom rlang sym
+#' @importFrom stats predict
 #' @importFrom magrittr %>%
 #'
 #' @export
-process_model <- function(model_obj, model_id, task, test_data, label, event_class, engine) {
+process_model <- function(model_obj, model_id, task, test_data, label, event_class,
+                          engine, train_data, metric) {
   # If the model object is a tuning result, finalize the workflow
   if (inherits(model_obj, "tune_results")) {
     best_params <- tryCatch({
@@ -882,9 +885,12 @@ process_model <- function(model_obj, model_id, task, test_data, label, event_cla
 
     pred_class <- predict(final_model, new_data = test_data, type = "class")$.pred_class
 
-    if(engine != "LiblineaR"){
-     pred_prob <- predict(final_model, new_data = test_data, type = "prob")
+
+    if (!is.null(engine) && !is.na(engine) && engine != "LiblineaR") {
+      pred_prob <- predict(final_model, new_data = test_data, type = "prob")
     }
+
+
 
     if(nrow(test_data) != length(pred_class)) {
       stop('The dataset has missing values. To handle this, set impute_method = "remove" to delete rows with missing values,
@@ -897,7 +903,7 @@ process_model <- function(model_obj, model_id, task, test_data, label, event_cla
       dplyr::select(truth = !!rlang::sym(label)) %>%
       dplyr::mutate(estimate = pred_class) %>%
       {
-        if (engine != "LiblineaR") {
+        if (!is.null(engine) && !is.na(engine) && engine != "LiblineaR") {
           dplyr::bind_cols(., pred_prob)
         } else {
           .
@@ -935,7 +941,7 @@ process_model <- function(model_obj, model_id, task, test_data, label, event_cla
       )
       perf_class <- metrics_class(data_metrics, truth = truth, estimate = estimate, event_level = event_class)
 
-      if(engine != "LiblineaR"){
+      if (!is.null(engine) && !is.na(engine) && engine != "LiblineaR") {
         # Compute ROC AUC using the probability column for the positive class
         roc_auc_value <- yardstick::roc_auc(
           data_metrics,
@@ -973,20 +979,24 @@ process_model <- function(model_obj, model_id, task, test_data, label, event_cla
         estimator = "macro"
       )
 
-      prob_cols <- names(pred_prob)
-      perf_roc_auc <- yardstick::roc_auc(
-        data_metrics,
-        truth = truth,
-        !!!rlang::syms(prob_cols),
-        estimator = "macro_weighted"
-      )
-      perf <- dplyr::bind_rows(perf_class, perf_roc_auc)
+      if (!is.null(engine) && !is.na(engine) && engine != "LiblineaR") {
+        prob_cols <- names(pred_prob)
+        perf_roc_auc <- yardstick::roc_auc(
+          data_metrics,
+          truth = truth,
+          !!!rlang::syms(prob_cols),
+          estimator = "macro_weighted"
+        )
+        perf <- dplyr::bind_rows(perf_class, perf_roc_auc)
+      } else {
+        perf <- perf_class
+      }
     }
   } else {
     # Regression task
     predictions <- predict(final_model, new_data = test_data)
     pred <- predictions$.pred
-    data_metrics <- tibble::tibble(truth = true_labels, estimate = pred)
+    data_metrics <- tibble::tibble(truth = test_data[[label]], estimate = pred)
     metrics_set <- yardstick::metric_set(yardstick::rmse, yardstick::rsq, yardstick::mae)
     perf <- metrics_set(data_metrics, truth = truth, estimate = estimate)
   }
@@ -1009,6 +1019,7 @@ process_model <- function(model_obj, model_id, task, test_data, label, event_cla
 #' @importFrom stats ave
 #'
 #' @export
+#'
 get_best_model_idx <- function(df, metric, group_cols = c("Model", "Engine")) {
   # Convert the metric to numeric in case it's not already
   metric_values <- as.numeric(as.character(df[[metric]]))
@@ -1017,13 +1028,23 @@ get_best_model_idx <- function(df, metric, group_cols = c("Model", "Engine")) {
   group_values <- interaction(df[, group_cols], drop = TRUE)
 
   # Compute the maximum metric for each group
-  group_max <- ave(metric_values, group_values, FUN = max)
+  if(metric %in% c("rmse", "mae")){
 
-  # Determine the overall best metric value
-  overall_max <- max(metric_values)
+    group_val <- ave(metric_values, group_values, FUN = min)
+    overall_val <- min(metric_values)
+
+
+  }else{
+
+    group_val <- ave(metric_values, group_values, FUN = max)
+    overall_val <- max(metric_values)
+
+
+  }
+
 
   # Identify groups whose maximum equals the overall maximum
-  best_groups <- unique(group_values[group_max == overall_max])
+  best_groups <- unique(group_values[group_val == overall_val])
 
   # Return indices where the group is one of the best groups
   idx <- which(group_values %in% best_groups)
