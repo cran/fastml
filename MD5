@@ -1,4 +1,4 @@
-40bcaf97b55c36064a80b8a59c3c2590 *DESCRIPTION
+9e13a4fdcc6d33dc87ca1f0c18b56329 *DESCRIPTION
 ab8af135f874d140e2c34e64127cecb4 *LICENSE
 121c39ff6958cf89c87a00a21edc91db *NAMESPACE
 ef47d3110427a635893f186d28444b1f *R/evaluate_models.R
@@ -7,8 +7,8 @@ e27bbbd4ff40ac8f376ee9bfe63d8c42 *R/fastexplain.R
 ae8def8d9cd9a865a542384363d7a39a *R/fastml.R
 3dbcba01f9754cd87097d4f1ddd31a3c *R/helper_functions.R
 286b64257310aa02e49e13f9bebe6e6c *R/models.R
-a778aaccdc96a7992b911a5b59baa174 *R/plot.fastml.R
-f22e38513983952438801c4924e5e0bf *R/predict.fastml.R
+b69a30cca3d55c6eb22b02fb3d3a5ebc *R/plot.fastml.R
+d89c070d60b8c64e87ba20323ff5f354 *R/predict.fastml.R
 77b491192f0d559634eee7b60ada1b92 *R/sanitize.R
 4149b6ed460b6accf762a07af5e698a6 *R/save.fastml.R
 985d83ebd35a90a2caa052073467687a *R/summary.fastml.R
@@ -31,8 +31,8 @@ a6dfc4ce2da926f4d7682fffedb67700 *man/framingham.Rd
 906f15cd63fe3c2600a5752405eb1c60 *man/get_engine_names.Rd
 99d5fb8c43d530a59d8b509df09cab48 *man/get_model_engine_names.Rd
 37ff86134796c938e9c535e646cfbfde *man/load_model.Rd
-df136fccaea92ffb61a29a81e12262b1 *man/plot.fastml.Rd
-aa4826448b6cd5292997c1bd1de26543 *man/predict.fastml.Rd
+978606dcfcea3613177273291ef14177 *man/plot.fastml.Rd
+6aa40d8f31ede3b5ca6e07e7bfb99781 *man/predict.fastml.Rd
 4c5e51b836a987827ee38d28afc70131 *man/process_model.Rd
 d281ee45f1c1b7c30011d3a65cceb3e5 *man/sanitize.Rd
 bfcf20449dbec9e6b61d87433b0fa877 *man/save.fastml.Rd

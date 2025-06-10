@@ -1,7 +1,7 @@
 Package: fastml
 Type: Package
 Title: Fast Machine Learning Model Training and Evaluation
-Version: 0.6.0
+Version: 0.6.1
 Authors@R: c(person("Selcuk", "Korkmaz", email="selcukorkmaz@gmail.com", role=c("aut", "cre"),
                     comment = c(ORCID = "0000-0003-4632-6850")), 
              person("Dincer", "Goksuluk", email="dincer.goksuluk@gmail.com", role="aut",
@@ -29,7 +29,7 @@ Suggests: testthat (>= 3.0.0), C50, glmnet, xgboost, ranger, crayon,
 RoxygenNote: 7.3.2
 Config/testthat/edition: 3
 NeedsCompilation: no
-Packaged: 2025-06-10 20:30:13 UTC; selcukkorkmaz
+Packaged: 2025-06-10 22:04:39 UTC; selcukkorkmaz
 Author: Selcuk Korkmaz [aut, cre] (ORCID:
     <https://orcid.org/0000-0003-4632-6850>),
   Dincer Goksuluk [aut] (ORCID: <https://orcid.org/0000-0002-2752-7668>),
@@ -38,4 +38,4 @@ Author: Selcuk Korkmaz [aut, cre] (ORCID:
 Maintainer: Selcuk Korkmaz <selcukorkmaz@gmail.com>
 Depends: R (>= 3.5.0)
 Repository: CRAN
-Date/Publication: 2025-06-10 20:50:01 UTC
+Date/Publication: 2025-06-10 22:50:02 UTC
