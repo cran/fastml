@@ -21,6 +21,12 @@ You can install the latest stable version of **fastml** from CRAN using:
 install.packages("fastml")
 ```
 
+You can install all dependencies (additional models) using:
+```r
+# install all dependencies - recommended
+install.packages("fastml", dependencies = TRUE)
+```
+
 ### From GitHub
 For the development version, install directly from GitHub using the devtools package:
 
@@ -52,5 +58,13 @@ model <- fastml(
 # View model summary
 summary(model)
 ```
+
+## Tuning Strategies
+
+fastml supports both grid search and Bayesian optimization through the
+`tuning_strategy` argument. Use `"grid"` for a regular parameter grid or
+`"bayes"` for Bayesian hyperparameter search. The `tuning_iterations`
+parameter controls the number of iterations **only** when
+`tuning_strategy = "bayes"` and is ignored otherwise.
 
 

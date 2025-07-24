@@ -12,6 +12,7 @@ train_models(
   resampling_method,
   folds,
   repeats,
+  resamples = NULL,
   tune_params,
   metric,
   summaryFunction = NULL,
@@ -40,7 +41,12 @@ train_models(
 
 \item{repeats}{Number of times to repeat cross-validation (only applicable for methods like "repeatedcv").}
 
-\item{tune_params}{List of hyperparameter tuning ranges.}
+\item{resamples}{Optional rsample object. If provided, custom resampling splits
+will be used instead of those created internally.}
+
+\item{tune_params}{A named list of tuning ranges. For each algorithm, supply a
+list of engine-specific parameter values, e.g.
+\code{list(rand_forest = list(ranger = list(mtry = c(1, 3)))).}}
 
 \item{metric}{The performance metric to optimize.}
 
@@ -50,11 +56,18 @@ train_models(
 
 \item{recipe}{A recipe object for preprocessing.}
 
-\item{use_default_tuning}{Logical indicating whether to use default tuning grids when \code{tune_params} is \code{NULL}.}
+\item{use_default_tuning}{Logical; if \code{TRUE} and \code{tune_params} is \code{NULL}, tuning is performed using default grids. Tuning also occurs when custom \code{tune_params} are supplied. When \code{FALSE} and no custom parameters are given, the model is fitted once with default settings.}
 
-\item{tuning_strategy}{A string specifying the tuning strategy ("grid", "bayes", or "none"), possibly with adaptive methods.}
+\item{tuning_strategy}{A string specifying the tuning strategy. Must be one of
+\code{"grid"}, \code{"bayes"}, or \code{"none"}. Adaptive methods may be
+used with \code{"grid"}. If \code{"none"} is selected, the workflow is fitted
+directly without tuning.
+If custom \code{tune_params} are supplied with \code{tuning_strategy = "none"},
+they will be ignored with a warning.}
 
-\item{tuning_iterations}{Number of iterations for iterative tuning methods.}
+\item{tuning_iterations}{Number of iterations for Bayesian tuning. Ignored
+when \code{tuning_strategy} is not \code{"bayes"}; validation occurs only
+for the Bayesian strategy.}
 
 \item{early_stopping}{Logical for early stopping in Bayesian tuning.}
 
