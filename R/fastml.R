@@ -13,9 +13,15 @@ utils::globalVariables(c("Fraction", "Performance"))
 #' @param data A data frame containing the complete dataset. If both `train_data` and `test_data` are `NULL`, `fastml()` will split this into training and testing sets according to `test_size` and `stratify`. Defaults to `NULL`.
 #' @param train_data A data frame pre-split for model training. If provided, `test_data` must also be supplied, and no internal splitting will occur. Defaults to `NULL`.
 #' @param test_data A data frame pre-split for model evaluation. If provided, `train_data` must also be supplied, and no internal splitting will occur. Defaults to `NULL`.
-#' @param label A string specifying the name of the target variable.
+#' @param label A string specifying the name of the target variable. For
+#'   survival analysis, supply a character vector with the names of the time and
+#'   status columns.
 #' @param algorithms A vector of algorithm names to use. Default is \code{"all"} to run all supported algorithms.
-#' @param task Character string specifying model type selection. Use "auto" to let the function detect whether the target is for classification or regression based on the data, or explicitly set to "classification" or "regression".
+#' @param task Character string specifying model type selection. Use "auto" to
+#'   let the function detect whether the target is for classification, regression,
+#'   or survival based on the data. Survival is detected when `label` is a
+#'   character vector of length 2 that matches time and status columns in the data.
+#'   You may also explicitly set to "classification", "regression", or "survival".
 #' @param test_size A numeric value between 0 and 1 indicating the proportion of the data to use for testing. Default is \code{0.2}.
 #' @param resampling_method A string specifying the resampling method for model evaluation. Default is \code{"cv"} (cross-validation).
 #'                          Other options include \code{"none"}, \code{"boot"}, \code{"repeatedcv"}, etc.
@@ -27,6 +33,14 @@ utils::globalVariables(c("Fraction", "Performance"))
 #' @param tune_params A named list of tuning ranges for each algorithm and engine
 #'   pair. Example: \code{list(rand_forest = list(ranger = list(mtry = c(1, 3))))}
 #'   will override the defaults for the ranger engine. Default is \code{NULL}.
+#' @param engine_params A named list of engine-level arguments to pass directly
+#'   to the underlying model fitting functions. Use this for fixed settings that
+#'   should apply whenever an engine is fitted (for example,
+#'   \code{list(royston_parmar = list(rstpm2 = list(link = "PO")))},
+#'   \code{list(cox_ph = list(survival = list(ties = "breslow")))}, or
+#'   \code{list(rand_forest = list(ranger = list(importance = "impurity")))}).
+#'   These arguments are distinct from \code{tune_params}, which define ranges of
+#'   hyperparameters to explore during tuning. Default is an empty list.
 #' @param metric The performance metric to optimize during training.
 #' @param algorithm_engines A named list specifying the engine to use for each algorithm.
 #' @param n_cores An integer specifying the number of CPU cores to use for parallel processing. Default is \code{1}.
@@ -46,7 +60,7 @@ utils::globalVariables(c("Fraction", "Performance"))
 #'   Default is \code{"error"}.
 #' @param impute_custom_function A function that takes a data.frame as input and returns an imputed data.frame. Used only if \code{impute_method = "custom"}.
 #' @param encode_categoricals Logical indicating whether to encode categorical variables. Default is \code{TRUE}.
-#' @param scaling_methods Vector of scaling methods to apply. Default is \code{c("center", "scale")}. 
+#' @param scaling_methods Vector of scaling methods to apply. Default is \code{c("center", "scale")}.
 #' @param balance_method Method to handle class imbalance. One of \code{"none"},
 #'   \code{"upsample"}, or \code{"downsample"}. Applied to the training set for
 #'   classification tasks. Default is \code{"none"}.
@@ -68,10 +82,23 @@ utils::globalVariables(c("Fraction", "Performance"))
 #' @param seed An integer value specifying the random seed for reproducibility.
 #' @param verbose Logical; if TRUE, prints progress messages during the training
 #'   and evaluation process.
+#' @param eval_times Optional numeric vector of evaluation horizons for survival
+#'   models. When \code{NULL}, defaults to the median and 75th percentile of the
+#'   observed follow-up times (rounded to the dataset's time unit).
+#' @param bootstrap_ci Logical indicating whether bootstrap confidence intervals
+#'   should be computed for performance metrics. Applies to all task types.
+#' @param bootstrap_samples Integer giving the number of bootstrap resamples to
+#'   use when \code{bootstrap_ci = TRUE}. Defaults to 500.
+#' @param bootstrap_seed Optional seed passed to the bootstrap procedure used to
+#'   estimate confidence intervals.
+#' @param at_risk_threshold Numeric value between 0 and 1 used for survival
+#'   metrics to determine the last follow-up time (\eqn{t_{max}}). The maximum
+#'   time is set to the largest observed time where at least this proportion of
+#'   subjects remain at risk.
 #' @importFrom magrittr %>%
 #' @importFrom rsample initial_split training testing
-#' @importFrom recipes recipe step_impute_median step_impute_knn step_impute_bag step_naomit step_dummy step_center step_scale prep bake all_numeric_predictors all_predictors all_nominal_predictors all_outcomes step_zv
-#' @importFrom dplyr filter pull rename_with mutate across where select all_of
+#' @importFrom recipes recipe step_impute_median step_impute_knn step_impute_bag step_naomit step_dummy step_center step_scale prep bake all_numeric_predictors all_predictors all_nominal_predictors all_outcomes step_zv step_rm
+#' @importFrom dplyr filter pull rename_with mutate across where select all_of group_by sample_n ungroup
 #' @importFrom rlang sym
 #' @importFrom stats as.formula complete.cases
 #' @importFrom doFuture registerDoFuture
@@ -81,6 +108,7 @@ utils::globalVariables(c("Fraction", "Performance"))
 #' @importFrom mice mice complete
 #' @importFrom missForest missForest
 #' @importFrom purrr flatten
+#' @importFrom tidyselect all_of
 #' @return An object of class \code{fastml} containing the best model, performance metrics, and other information.
 #' @examples
 #' \donttest{
@@ -126,6 +154,7 @@ fastml <- function(data = NULL,
                    exclude = NULL,
                    recipe = NULL,
                    tune_params = NULL,
+                   engine_params = list(),
                    metric = NULL,
                    algorithm_engines = NULL,
                    n_cores = 1,
@@ -134,7 +163,7 @@ fastml <- function(data = NULL,
                    impute_custom_function = NULL,
                    encode_categoricals = TRUE,
                    scaling_methods = c("center", "scale"),
-                   balance_method = c("none", "upsample", "downsample"),
+                   balance_method = "none",
                    resamples = NULL,
                    summaryFunction = NULL,
                    use_default_tuning = FALSE,
@@ -144,13 +173,17 @@ fastml <- function(data = NULL,
                    adaptive = FALSE,
                    learning_curve = FALSE,
                    seed = 123,
-                   verbose = FALSE) {
+                   verbose = FALSE,
+                   eval_times = NULL,
+                   bootstrap_ci = TRUE,
+                   bootstrap_samples = 500,
+                   bootstrap_seed = NULL,
+                   at_risk_threshold = 0.1) {
 
   set.seed(seed)
 
-  task <- match.arg(task, c("auto", "classification", "regression"))
+  task <- match.arg(task, c("auto", "classification", "regression", "survival"))
   tuning_strategy <- match.arg(tuning_strategy, c("grid", "bayes", "none"))
-  balance_method <- match.arg(balance_method)
 
   # If explicit train/test provided, ensure both are given
   if (!is.null(train_data) || !is.null(test_data)) {
@@ -167,49 +200,91 @@ fastml <- function(data = NULL,
 
   # Determine source for target variable
   source_data <- if (!is.null(data)) data else train_data
-  # Ensure label exists in source
-  if (!(label %in% names(source_data))) {
-    stop("Label variable must exist in the data source.")
-  }
-  target_var <- source_data[[label]]
 
-
-
-  if(task == "auto"){
-    if (is.numeric(target_var) && length(unique(target_var)) <= 5) {
-      # convert to factor in both splits
-      train_data[[label]] <- factor(train_data[[label]])
-      test_data[[label]]  <- factor(test_data[[label]], levels = levels(train_data[[label]]))
-      task <- "classification"
-      warning(sprintf(
-        "The target variable '%s' is numeric with %d unique values. Converted to factor; task set to 'classification'.",
-        label, length(unique(target_var))
-      ))
-    } else if (is.factor(target_var) || is.character(target_var) || is.logical(target_var)) {
-      task <- "classification"
-    } else if (is.numeric(target_var)) {
-      task <- "regression"
+  # Auto-detect task if requested, including survival when label has two columns
+  if (task == "auto") {
+    # survival detection: label is c(time_col, status_col)
+    if (is.character(label) && length(label) %in% c(2, 3)) {
+      if (!all(label %in% names(source_data))) {
+        missing_vars <- setdiff(label, names(source_data))
+        stop(paste0(
+          "When task='auto' and 'label' has length ",
+          length(label),
+          ", the specified columns must exist in the data for survival detection. Missing: ",
+          paste(missing_vars, collapse = ", ")
+        ))
+      }
+      time_cols <- if (length(label) == 3) label[1:2] else label[1]
+      status_col <- label[length(label)]
+      time_ok <- all(vapply(time_cols, function(col) is.numeric(source_data[[col]]), logical(1)))
+      status_vec <- source_data[[status_col]]
+      uniq_status <- unique(status_vec)
+      status_ok <- is.logical(status_vec) || length(uniq_status) == 2
+      if (time_ok && status_ok) {
+        task <- "survival"
+        target_var <- NULL
+      } else {
+        stop("Unable to detect survival task automatically: ensure time/start/stop are numeric and status has two unique values.")
+      }
     } else {
-      stop("Unable to detect task type. The target variable must be numeric, factor, character, or logical.")
+      # classification/regression detection with single target label
+      if (!(label %in% names(source_data))) {
+        stop("Label variable must exist in the data source.")
+      }
+      target_var <- source_data[[label]]
+      if (is.numeric(target_var) && length(unique(target_var)) <= 5) {
+        task <- "classification"
+        warning(sprintf(
+          "The target variable '%s' is numeric with %d unique values. Converted to factor; task set to 'classification'.",
+          label, length(unique(target_var))
+        ))
+      } else if (is.factor(target_var) || is.character(target_var) || is.logical(target_var)) {
+        task <- "classification"
+      } else if (is.numeric(target_var)) {
+        task <- "regression"
+      } else {
+        stop("Unable to detect task type. The target variable must be numeric, factor, character, or logical.")
+      }
     }
-
-  }
-
-  if(task == "classification"){
-    positive_class <- ifelse(event_class == "first",
-                             levels(source_data[[label]])[1],
-                             levels(source_data[[label]])[2])
   } else {
-    positive_class = NULL
+    # Non-auto: validate label(s) exist and set target_var when applicable
+    if (task == "survival") {
+      if (!(length(label) %in% c(2, 3)) || !all(label %in% names(source_data))) {
+        stop("For survival tasks, 'label' must contain the time/status columns present in the data (length 2 or 3).")
+      }
+      target_var <- NULL
+    } else {
+      if (!(label %in% names(source_data))) {
+        stop("Label variable must exist in the data source.")
+      }
+      target_var <- source_data[[label]]
+    }
   }
+
+  # determine positive_class after data split when factor levels are available
+  positive_class <- NULL
   # ---------------- END TASK DETECTION ----------------
 
 
   # If initial data provided, perform exclusion and checks, then split
   if (!is.null(data)) {
-    if (!(label %in% names(data))) stop("The specified label does not exist in the data.")
+    if (task == "survival") {
+      if (!all(label %in% names(data))) {
+        stop("The specified label(s) do not exist in the data.")
+      }
+    } else {
+      if (!(label %in% names(data))) {
+        stop("The specified label does not exist in the data.")
+      }
+    }
     if (!is.null(exclude)) {
-      if (label %in% exclude) stop("Label variable cannot be excluded: ", label)
+      if (task == "survival") {
+        if (any(label %in% exclude)) {
+          stop("Label variable(s) cannot be excluded: ", paste(label[label %in% exclude], collapse = ", "))
+        }
+      } else {
+        if (label %in% exclude) stop("Label variable cannot be excluded: ", label)
+      }
       missing_vars <- setdiff(exclude, colnames(data))
       if (length(missing_vars) > 0) {
         warning("Variables not in data: ", paste(missing_vars, collapse = ", "))
@@ -229,10 +304,15 @@ fastml <- function(data = NULL,
     if (verbose) message("Splitting data into training and test sets...")
     # Split into train/test
     if (stratify && task == "classification") {
-      split <- rsample::initial_split(data, prop = 1 - test_size, strata = label)
+      split <- rsample::initial_split(
+        data,
+        prop = 1 - test_size,
+        strata = tidyselect::all_of(label)
+      )
     } else {
       split <- rsample::initial_split(data, prop = 1 - test_size)
     }
+
     train_data <- rsample::training(split)
     test_data  <- rsample::testing(split)
   }
@@ -255,14 +335,65 @@ fastml <- function(data = NULL,
     }
   }
 
+  if (task == "survival") {
+    if (!(length(label) %in% c(2, 3))) {
+      stop("For survival tasks, 'label' must contain the time/status columns present in the data (length 2 or 3).")
+    }
+    label_surv <- label
+    status_warning_emitted <- FALSE
+    normalize_status <- function(vec, reference_length) {
+      res <- fastml_normalize_survival_status(vec, reference_length)
+      if (res$recoded && !status_warning_emitted) {
+        warning("Detected non-standard survival status coding; recoding to 0 = censored and 1 = event.", call. = FALSE)
+        status_warning_emitted <<- TRUE
+      }
+      res$status
+    }
+    if (length(label) == 2) {
+      start_col = NULL
+      time_col <- label[1]
+      status_col <- label[2]
+      train_status <- normalize_status(train_data[[status_col]], nrow(train_data))
+      test_status  <- normalize_status(test_data[[status_col]], nrow(test_data))
+      train_data[[status_col]] <- train_status
+      test_data[[status_col]]  <- test_status
+      surv_train <- survival::Surv(train_data[[time_col]], train_status)
+      surv_test  <- survival::Surv(test_data[[time_col]], test_status)
+    } else {
+      start_col <- label[1]
+      stop_col <- label[2]
+      status_col <- label[3]
+      train_status <- normalize_status(train_data[[status_col]], nrow(train_data))
+      test_status  <- normalize_status(test_data[[status_col]], nrow(test_data))
+      train_data[[status_col]] <- train_status
+      test_data[[status_col]]  <- test_status
+      surv_train <- survival::Surv(train_data[[start_col]], train_data[[stop_col]], train_status)
+      surv_test  <- survival::Surv(test_data[[start_col]], test_data[[stop_col]], test_status)
+    }
+    attr(surv_train, "fastml_label_cols") <- label_surv
+    attr(surv_test, "fastml_label_cols") <- label_surv
+    train_data$surv_obj <- surv_train
+    test_data$surv_obj <- surv_test
+    label <- "surv_obj"
+  } else {
+    label_surv <- label
+  }
+
 
   if (is.null(metric)) {
-    metric <- if (task == "classification") "accuracy" else "rmse"
+    metric <- if (task == "classification") {
+      "accuracy"
+    } else if (task == "regression") {
+      "rmse"
+    } else {
+      "ibs"
+    }
   }
 
   # Define allowed metrics
   allowed_metrics_classification <- c("accuracy", "kap", "sens", "spec", "precision", "f_meas", "roc_auc")
   allowed_metrics_regression <- c("rmse", "rsq", "mae")
+  allowed_metrics_survival <- c("c_index", "uno_c", "ibs", "rmst_diff")
 
   # Validate the metric based on the task
   if (task == "classification") {
@@ -270,10 +401,15 @@ fastml <- function(data = NULL,
       stop(paste0("Invalid metric for classification task. Choose one of: ",
                   paste(allowed_metrics_classification, collapse = ", "), "."))
     }
-  } else {  # regression
+  } else if (task == "regression") {
     if (!(metric %in% allowed_metrics_regression) && is.null(summaryFunction)) {
       stop(paste0("Invalid metric for regression task. Choose one of: ",
                   paste(allowed_metrics_regression, collapse = ", "), "."))
+    }
+  } else {
+    if (!(metric %in% allowed_metrics_survival || grepl("^brier_t", metric))) {
+      stop(paste0("Invalid metric for survival task. Choose one of: ",
+                  paste(c(allowed_metrics_survival, "brier_t*"), collapse = ", "), "."))
     }
   }
 
@@ -294,22 +430,24 @@ fastml <- function(data = NULL,
 
 
 
-  # Task detection and numeric-to-factor conversion for small numeric targets
-  if (is.numeric(target_var) && length(unique(target_var)) <= 5) {
-    # Convert both train and test labels to factor
-    train_data[[label]] <- factor(train_data[[label]])
-    test_data[[label]]  <- factor(test_data[[label]], levels = levels(train_data[[label]]))
-    task <- "classification"
-    warning(sprintf(
-      "The target variable '%s' is numeric with %d unique values. Converted to factor; task set to 'classification'.",
-      label, length(unique(target_var))
-    ))
-  } else if (is.factor(target_var) || is.character(target_var) || is.logical(target_var)) {
-    task <- "classification"
-  } else if (is.numeric(target_var)) {
-    task <- "regression"
-  } else {
-    stop("Unable to detect task type. The target variable must be numeric, factor, character, or logical.")
+  if (task != "survival") {
+    # Task detection and numeric-to-factor conversion for small numeric targets
+    if (is.numeric(target_var) && length(unique(target_var)) <= 5) {
+      # Convert both train and test labels to factor
+      train_data[[label]] <- factor(train_data[[label]])
+      test_data[[label]]  <- factor(test_data[[label]], levels = levels(train_data[[label]]))
+      task <- "classification"
+      warning(sprintf(
+        "The target variable '%s' is numeric with %d unique values. Converted to factor; task set to 'classification'.",
+        label, length(unique(target_var))
+      ))
+    } else if (is.factor(target_var) || is.character(target_var) || is.logical(target_var)) {
+      task <- "classification"
+    } else if (is.numeric(target_var)) {
+      task <- "regression"
+    } else {
+      stop("Unable to detect task type. The target variable must be numeric, factor, character, or logical.")
+    }
   }
 
 
@@ -337,9 +475,17 @@ fastml <- function(data = NULL,
   if (task == "classification") {
     train_data[[label]] <- as.factor(train_data[[label]])
     test_data[[label]] <- factor(test_data[[label]], levels = levels(train_data[[label]]))
-  } else {
+    if (length(levels(train_data[[label]])) >= 2) {
+      positive_class <- ifelse(event_class == "first",
+                               levels(train_data[[label]])[1],
+                               levels(train_data[[label]])[2])
+    }
+  } else if (task == "regression") {
     train_data[[label]] <- as.numeric(train_data[[label]])
     test_data[[label]] <- as.numeric(test_data[[label]])
+    positive_class <- NULL
+  } else {
+    positive_class <- NULL
   }
 
   ###############################################################################
@@ -353,6 +499,9 @@ fastml <- function(data = NULL,
 
     if (!is.null(impute_method) && impute_method %in% c("mice", "missForest", "custom")) {
 
+      outcome_cols <- unique(c(label, if (task == "survival") label_surv else character()))
+      outcome_cols <- outcome_cols[outcome_cols %in% names(train_data)]
+
       # If 'custom', user must provide a function
       if (impute_method == "custom") {
         if (!is.function(impute_custom_function)) {
@@ -364,47 +513,80 @@ fastml <- function(data = NULL,
 
         warning("Missing values in the training and test set have been imputed using the 'custom' method.")
 
-
-        } else if (impute_method == "mice") {
-          if (!requireNamespace("mice", quietly = TRUE)) {
-            stop("impute_method='mice' requires the 'mice' package to be installed.")
+      } else if (impute_method == "mice") {
+        if (!requireNamespace("mice", quietly = TRUE)) {
+          stop("impute_method='mice' requires the 'mice' package to be installed.")
+        }
+        # Perform MICE on predictors only to avoid leaking outcome information.
+        train_predictor_cols <- setdiff(names(train_data), outcome_cols)
+        if (length(train_predictor_cols) > 0) {
+          train_predictors <- train_data[, train_predictor_cols, drop = FALSE]
+          matrix_cols_train <- vapply(train_predictors, is.matrix, logical(1))
+          if (any(matrix_cols_train)) {
+            train_matrix <- train_predictors[, matrix_cols_train, drop = FALSE]
+            train_non_matrix <- train_predictors[, !matrix_cols_train, drop = FALSE]
+            if (ncol(train_non_matrix) > 0) {
+              train_data_mice <- mice(train_non_matrix)
+              train_non_matrix <- complete(train_data_mice)
+            }
+            train_predictors <- cbind(train_non_matrix, train_matrix)
+            train_predictors <- train_predictors[, train_predictor_cols, drop = FALSE]
+          } else {
+            train_data_mice <- mice(train_predictors)
+            train_predictors <- complete(train_data_mice)
           }
-          # Perform MICE on train_data only. Typically, you do MICE on training and apply
-          # some approach to test, but for simplicity, we'll do them separately:
-          # 1) For train_data:
-          train_data_mice <- mice(train_data)  # Basic usage
-          train_data <- complete(train_data_mice)
+          train_data[, train_predictor_cols] <- train_predictors[, train_predictor_cols, drop = FALSE]
+        }
 
-          warning("Missing values in the training set have been imputed using the 'mice' method.")
+        warning("Missing values in the training set have been imputed using the 'mice' method.")
 
-          # 2) For test_data:
-          # There's no built-in perfect approach for test_data in MICE. For simplicity,
-          # we do a quick single pass (though in practice you might combine with train).
-          # We'll create a temporary combined approach or re-run MICE on test alone.
-          # This is simplistic but workable for demonstration.
-          if (anyNA(test_data)) {
-            test_data_mice <- mice(test_data)
-            test_data <- complete(test_data_mice)
-
-            warning("Missing values in the test set have been imputed using the 'mice' method.")
-
+        # Repeat for test predictors when needed
+        if (anyNA(test_data)) {
+          test_predictor_cols <- setdiff(names(test_data), outcome_cols)
+          if (length(test_predictor_cols) > 0) {
+            test_predictors <- test_data[, test_predictor_cols, drop = FALSE]
+            matrix_cols_test <- vapply(test_predictors, is.matrix, logical(1))
+            if (any(matrix_cols_test)) {
+              test_matrix <- test_predictors[, matrix_cols_test, drop = FALSE]
+              test_non_matrix <- test_predictors[, !matrix_cols_test, drop = FALSE]
+              if (ncol(test_non_matrix) > 0) {
+                test_data_mice <- mice(test_non_matrix)
+                test_non_matrix <- complete(test_data_mice)
+              }
+              test_predictors <- cbind(test_non_matrix, test_matrix)
+              test_predictors <- test_predictors[, test_predictor_cols, drop = FALSE]
+            } else {
+              test_data_mice <- mice(test_predictors)
+              test_predictors <- complete(test_data_mice)
+            }
+            test_data[, test_predictor_cols] <- test_predictors[, test_predictor_cols, drop = FALSE]
           }
 
-        } else if (impute_method == "missForest") {
+          warning("Missing values in the test set have been imputed using the 'mice' method.")
+
+        }
+
+      } else if (impute_method == "missForest") {
         if (!requireNamespace("missForest", quietly = TRUE)) {
           stop("impute_method='missForest' requires the 'missForest' package to be installed.")
         }
-        # Perform missForest on train_data
-        train_data_imp <- missForest(train_data, verbose = FALSE)
-        train_data <- train_data_imp$ximp
+        train_predictor_cols <- setdiff(names(train_data), outcome_cols)
+        if (length(train_predictor_cols) > 0) {
+          train_data_imp <- missForest(train_data[, train_predictor_cols, drop = FALSE], verbose = FALSE)
+          imputed_train <- train_data_imp$ximp
+          train_data[, train_predictor_cols] <- imputed_train[, train_predictor_cols, drop = FALSE]
+        }
 
         warning("Missing values in the training set have been imputed using the 'missForest' method.")
 
-
         # Similarly for test_data if needed
         if (anyNA(test_data)) {
-          test_data_imp <- missForest(test_data, verbose = FALSE)
-          test_data <- test_data_imp$ximp
+          test_predictor_cols <- setdiff(names(test_data), outcome_cols)
+          if (length(test_predictor_cols) > 0) {
+            test_data_imp <- missForest(test_data[, test_predictor_cols, drop = FALSE], verbose = FALSE)
+            imputed_test <- test_data_imp$ximp
+            test_data[, test_predictor_cols] <- imputed_test[, test_predictor_cols, drop = FALSE]
+          }
 
           warning("Missing values in the test set have been imputed using the 'missForest' method.")
 
@@ -450,8 +632,11 @@ fastml <- function(data = NULL,
     if (verbose) message("Creating preprocessing recipe...")
     # Build a default recipe, possibly skipping recipe-based imputation if advanced used
     recipe <- recipe(as.formula(paste(label, "~ .")), data = train_data)
+    if (task == "survival") {
+      recipe <- recipe %>% step_rm(all_of(label_surv))
+    }
 
-    # Remove zero-variance predictors
+    # Remove zero-variance predictors before any additional transformations
     recipe <- recipe %>%
       step_zv(all_predictors())
 
@@ -494,6 +679,10 @@ fastml <- function(data = NULL,
     # If encoding needed
     if (encode_categoricals) {
       recipe <- recipe %>% step_dummy(all_nominal_predictors(), -all_outcomes())
+
+      # Encoding can introduce zero-variance predictors (e.g., unused levels),
+      # which would otherwise trigger warnings during subsequent scaling steps.
+      recipe <- recipe %>% step_zv(all_predictors())
     }
 
     # scaling
@@ -529,6 +718,7 @@ fastml <- function(data = NULL,
     repeats = repeats,
     resamples = resamples,
     tune_params = tune_params,
+    engine_params = engine_params,
     metric = metric,
     summaryFunction = summaryFunction,
     seed = seed,
@@ -550,50 +740,172 @@ fastml <- function(data = NULL,
   }
 
   if (verbose) message("Evaluating models...")
-  eval_output <- evaluate_models(models, train_data, test_data, label, task, metric, event_class)
+  eval_output <- evaluate_models(models,
+                                train_data,
+                                test_data,
+                                label_surv,
+                                start_col,
+                                time_col,
+                                status_col,
+                                task,
+                                metric,
+                                event_class,
+                                eval_times = eval_times,
+                                bootstrap_ci = bootstrap_ci,
+                                bootstrap_samples = bootstrap_samples,
+                                bootstrap_seed = bootstrap_seed,
+                                at_risk_threshold = at_risk_threshold)
   performance <- eval_output$performance
   predictions <- eval_output$predictions
 
   # metric_values <- sapply(performance, function(x) x %>% filter(.metric == metric) %>% pull(.estimate))
 
-  # Create a new list where each element's name is "algorithm (engine)"
+  # Build a normalized performance list and align model names as "algorithm (engine)"
   combined_performance  <- list()
+  model_map <- list()
   for (alg in names(performance)) {
-    for (eng in names(performance[[alg]])) {
+    perf_alg <- performance[[alg]]
+    # Case 1: nested by engine (list of tibbles)
+    if (is.list(perf_alg) && !inherits(perf_alg, "data.frame")) {
+      for (eng in names(perf_alg)) {
+        combined_name <- paste0(alg, " (", eng, ")")
+        combined_performance[[combined_name]] <- perf_alg[[eng]]
+        # Map corresponding model
+        if (is.list(models[[alg]]) && !inherits(models[[alg]], "workflow") && !inherits(models[[alg]], "tune_results")) {
+          model_map[[combined_name]] <- models[[alg]][[eng]]
+        } else {
+          model_map[[combined_name]] <- models[[alg]]
+        }
+      }
+    } else if (inherits(perf_alg, "data.frame")) {
+      # Case 2: single workflow (tibble). Infer engine name when possible
+      eng_candidates <- tryCatch(engine_names[[alg]], error = function(e) NULL)
+      eng <- if (!is.null(eng_candidates) && length(eng_candidates) >= 1 && !is.na(eng_candidates[1])) {
+        eng_candidates[1]
+      } else {
+        tryCatch(get_default_engine(alg, task), error = function(e) "unknown")
+      }
       combined_name <- paste0(alg, " (", eng, ")")
-      combined_performance[[combined_name]] <- performance[[alg]][[eng]]
+      combined_performance[[combined_name]] <- perf_alg
+      model_map[[combined_name]] <- models[[alg]]
     }
   }
 
-  if(length(names(models)) == length(names(combined_performance))) {
-    names(models) <- names(combined_performance)
-    models = lapply(models, function(x) x[[1]])
-
-  } else {
-
-    models <- flatten_and_rename_models(models)
-    names(models) <- names(models)
-
-
+  survival_brier_times <- NULL
+  survival_t_max <- NULL
+  if (task == "survival") {
+    for (entry in combined_performance) {
+      if (is.data.frame(entry)) {
+        times_attr <- attr(entry, "brier_times")
+        tmax_attr <- attr(entry, "t_max")
+        if (!is.null(times_attr) || !is.null(tmax_attr)) {
+          survival_brier_times <- times_attr
+          survival_t_max <- tmax_attr
+          break
+        }
+      }
+    }
   }
+
+  # Replace models with normalized, consistently named map
+  models <- model_map
 
 
   # Now apply the function over the flattened list
-  metric_values <- sapply(combined_performance, function(x) {
-    x %>% filter(.metric == metric) %>% pull(.estimate)
-  })
-
-
-  if (any(is.na(metric_values))) {
-    warning("Some models did not return the specified metric.")
-    metric_values[is.na(metric_values)] <- if (task == "regression") Inf else -Inf
+  lower_is_better_metrics <- c("rmse", "mae", "ibs", "logloss", "mse", "brier_score")
+  extract_metric_values <- function(metric_name) {
+    sapply(combined_performance, function(x) {
+      if (is.data.frame(x)) {
+        vals <- x[x$.metric == metric_name, ".estimate", drop = TRUE]
+        if (length(vals) == 0) {
+          NA_real_
+        } else {
+          as.numeric(vals[1])
+        }
+      } else {
+        NA_real_
+      }
+    })
   }
 
-  if (all(metric_values == if (task == "regression") Inf else -Inf)) {
+  compute_lower_is_better <- function(metric_name) {
+    if (is.null(metric_name) || length(metric_name) == 0 || is.na(metric_name)) {
+      return(FALSE)
+    }
+    direction <- tryCatch({
+      if (requireNamespace("yardstick", quietly = TRUE) &&
+          exists(metric_name, envir = asNamespace("yardstick"), inherits = FALSE)) {
+        attr(get(metric_name, envir = asNamespace("yardstick")), "direction", exact = TRUE)
+      } else {
+        NA_character_
+      }
+    }, error = function(e) NA_character_)
+
+    if (!is.na(direction) && !is.null(direction)) {
+      identical(direction, "minimize")
+    } else {
+      metric_name %in% lower_is_better_metrics ||
+        grepl("^brier_t", metric_name) ||
+        grepl("brier", metric_name, fixed = TRUE)
+    }
+  }
+
+  metric_values <- extract_metric_values(metric)
+  lower_is_better <- compute_lower_is_better(metric)
+
+  if (!any(is.finite(metric_values))) {
+    available_metrics <- unique(unlist(lapply(combined_performance, function(x) {
+      if (is.data.frame(x)) {
+        as.character(x$.metric)
+      } else {
+        character(0)
+      }
+    })))
+
+    fallback_priority <- if (task == "classification") {
+      c("roc_auc", "accuracy", "kap", "sens", "spec", "precision", "f_meas")
+    } else if (task == "regression") {
+      c("rmse", "mae", "rsq")
+    } else {
+      c("c_index", "uno_c", "ibs", "rmst_diff")
+    }
+
+    candidate_metrics <- setdiff(fallback_priority, metric)
+    candidate_metrics <- candidate_metrics[candidate_metrics %in% available_metrics]
+    remaining_metrics <- setdiff(available_metrics, c(metric, candidate_metrics))
+    candidate_metrics <- c(candidate_metrics, remaining_metrics)
+
+    fallback_metric <- NULL
+    for (cand in candidate_metrics) {
+      cand_values <- extract_metric_values(cand)
+      if (any(is.finite(cand_values))) {
+        fallback_metric <- cand
+        metric_values <- cand_values
+        lower_is_better <- compute_lower_is_better(cand)
+        break
+      }
+    }
+
+    if (!is.null(fallback_metric)) {
+      warning(sprintf("Metric '%s' unavailable across models; falling back to '%s'.", metric, fallback_metric), call. = FALSE)
+      metric <- fallback_metric
+    }
+  }
+
+  if (!any(is.finite(metric_values))) {
     stop("None of the models returned the specified metric.")
   }
 
-  best_model_idx <- if (task == "regression" && metric != "rsq"){
+  if (any(is.na(metric_values))) {
+    warning("Some models did not return the specified metric.")
+    metric_values[is.na(metric_values)] <- if (lower_is_better) Inf else -Inf
+  }
+
+  if (all(metric_values == if (lower_is_better) Inf else -Inf)) {
+    stop("None of the models returned the specified metric.")
+  }
+
+  best_model_idx <- if (lower_is_better) {
     names(metric_values[metric_values == min(metric_values)])
   } else {
     names(metric_values[metric_values == max(metric_values)])
@@ -656,7 +968,8 @@ fastml <- function(data = NULL,
        folds = folds,
        repeats = repeats,
        resamples = resamples,
-       tune_params = tune_params,
+        tune_params = tune_params,
+        engine_params = engine_params,
         metric = metric,
         summaryFunction = summaryFunction,
         seed = seed,
@@ -676,10 +989,15 @@ fastml <- function(data = NULL,
         sub_models,
         sub_train,
         test_data,
-        label,
+        label_surv,
         task,
         metric,
-        event_class
+        event_class,
+        eval_times = eval_times,
+        bootstrap_ci = bootstrap_ci,
+        bootstrap_samples = bootstrap_samples,
+        bootstrap_seed = bootstrap_seed,
+        at_risk_threshold = at_risk_threshold
       )
 
 
@@ -731,7 +1049,10 @@ fastml <- function(data = NULL,
     metric = metric,
     positive_class = positive_class,
     event_class = event_class,
-    engine_names = engine_names
+    engine_names = engine_names,
+    survival_brier_times = survival_brier_times,
+    survival_t_max = survival_t_max,
+    metric_bootstrap = list(enabled = bootstrap_ci, samples = bootstrap_samples, seed = bootstrap_seed)
   )
   class(result) <- "fastml"
   if (verbose) message("Training complete.")

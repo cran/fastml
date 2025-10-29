@@ -19,6 +19,7 @@ fastml(
   exclude = NULL,
   recipe = NULL,
   tune_params = NULL,
+  engine_params = list(),
   metric = NULL,
   algorithm_engines = NULL,
   n_cores = 1,
@@ -27,7 +28,7 @@ fastml(
   impute_custom_function = NULL,
   encode_categoricals = TRUE,
   scaling_methods = c("center", "scale"),
-  balance_method = c("none", "upsample", "downsample"),
+  balance_method = "none",
   resamples = NULL,
   summaryFunction = NULL,
   use_default_tuning = FALSE,
@@ -37,7 +38,12 @@ fastml(
   adaptive = FALSE,
   learning_curve = FALSE,
   seed = 123,
-  verbose = FALSE
+  verbose = FALSE,
+  eval_times = NULL,
+  bootstrap_ci = TRUE,
+  bootstrap_samples = 500,
+  bootstrap_seed = NULL,
+  at_risk_threshold = 0.1
 )
 }
 \arguments{
@@ -47,11 +53,17 @@ fastml(
 
 \item{test_data}{A data frame pre-split for model evaluation. If provided, `train_data` must also be supplied, and no internal splitting will occur. Defaults to `NULL`.}
 
-\item{label}{A string specifying the name of the target variable.}
+\item{label}{A string specifying the name of the target variable. For
+survival analysis, supply a character vector with the names of the time and
+status columns.}
 
 \item{algorithms}{A vector of algorithm names to use. Default is \code{"all"} to run all supported algorithms.}
 
-\item{task}{Character string specifying model type selection. Use "auto" to let the function detect whether the target is for classification or regression based on the data, or explicitly set to "classification" or "regression".}
+\item{task}{Character string specifying model type selection. Use "auto" to
+let the function detect whether the target is for classification, regression,
+or survival based on the data. Survival is detected when `label` is a
+character vector of length 2 that matches time and status columns in the data.
+You may also explicitly set to "classification", "regression", or "survival".}
 
 \item{test_size}{A numeric value between 0 and 1 indicating the proportion of the data to use for testing. Default is \code{0.2}.}
 
@@ -71,6 +83,15 @@ Other options include \code{"none"}, \code{"boot"}, \code{"repeatedcv"}, etc.}
 \item{tune_params}{A named list of tuning ranges for each algorithm and engine
 pair. Example: \code{list(rand_forest = list(ranger = list(mtry = c(1, 3))))}
 will override the defaults for the ranger engine. Default is \code{NULL}.}
+
+\item{engine_params}{A named list of engine-level arguments to pass directly
+to the underlying model fitting functions. Use this for fixed settings that
+should apply whenever an engine is fitted (for example,
+\code{list(royston_parmar = list(rstpm2 = list(link = "PO")))},
+\code{list(cox_ph = list(survival = list(ties = "breslow")))}, or
+\code{list(rand_forest = list(ranger = list(importance = "impurity")))}).
+These arguments are distinct from \code{tune_params}, which define ranges of
+hyperparameters to explore during tuning. Default is an empty list.}
 
 \item{metric}{The performance metric to optimize during training.}
 
@@ -131,6 +152,24 @@ occurs for the Bayesian strategy. Default is \code{10}.}
 
 \item{verbose}{Logical; if TRUE, prints progress messages during the training
 and evaluation process.}
+
+\item{eval_times}{Optional numeric vector of evaluation horizons for survival
+models. When \code{NULL}, defaults to the median and 75th percentile of the
+observed follow-up times (rounded to the dataset's time unit).}
+
+\item{bootstrap_ci}{Logical indicating whether bootstrap confidence intervals
+should be computed for performance metrics. Applies to all task types.}
+
+\item{bootstrap_samples}{Integer giving the number of bootstrap resamples to
+use when \code{bootstrap_ci = TRUE}. Defaults to 500.}
+
+\item{bootstrap_seed}{Optional seed passed to the bootstrap procedure used to
+estimate confidence intervals.}
+
+\item{at_risk_threshold}{Numeric value between 0 and 1 used for survival
+metrics to determine the last follow-up time (\eqn{t_{max}}). The maximum
+time is set to the largest observed time where at least this proportion of
+subjects remain at risk.}
 }
 \value{
 An object of class \code{fastml} containing the best model, performance metrics, and other information.

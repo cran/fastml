@@ -14,6 +14,7 @@ train_models(
   repeats,
   resamples = NULL,
   tune_params,
+  engine_params = list(),
   metric,
   summaryFunction = NULL,
   seed = 123,
@@ -31,7 +32,7 @@ train_models(
 
 \item{label}{Name of the target variable.}
 
-\item{task}{Type of task: "classification" or "regression".}
+\item{task}{Type of task: "classification", "regression", or "survival".}
 
 \item{algorithms}{Vector of algorithm names to train.}
 
@@ -47,6 +48,12 @@ will be used instead of those created internally.}
 \item{tune_params}{A named list of tuning ranges. For each algorithm, supply a
 list of engine-specific parameter values, e.g.
 \code{list(rand_forest = list(ranger = list(mtry = c(1, 3)))).}}
+
+\item{engine_params}{A named list of fixed engine-level arguments passed
+directly to the model fitting call for each algorithm/engine combination.
+Use this to control options like \code{ties = "breslow"} for Cox models or
+\code{importance = "impurity"} for ranger. Unlike \code{tune_params}, these
+values are not tuned over a grid.}
 
 \item{metric}{The performance metric to optimize.}
 

@@ -1,6 +1,7 @@
 #' Define Random Forest Model Specification
 #'
-#' @param task Character string specifying the task type: "classification" or "regression".
+#' @param task Character string specifying the task type: "classification",
+#'   "regression", or "survival".
 #' @param train_data Data frame containing the training data.
 #' @param label Character string specifying the name of the target variable.
 #' @param tune Logical indicating whether to use tuning parameters.
@@ -18,62 +19,100 @@ define_rand_forest_spec <- function(task, train_data, label, tuning = FALSE, eng
   # (Assumes get_default_params returns a list with mtry, trees, and min_n.)
   defaults <- get_default_params("rand_forest", task, num_predictors, engine)
 
-  # Build the base model spec with tuning or default values.
-  if (tuning) {
-    model_spec <- rand_forest(
-      mtry  = tune(),
-      trees = tune(),
-      min_n = tune()
-    )
-  } else {
-    model_spec <- rand_forest(
-      mtry  = defaults$mtry,
-      trees = defaults$trees,
-      min_n = defaults$min_n
-    )
-  }
+  if (task == "survival") {
 
-  # Set the model mode (e.g. "classification", "regression", etc.)
-  model_spec <- model_spec %>% set_mode(task)
-
-  # Engine-specific parameter settings:
-  # - For ranger (the default engine), if doing classification, we enable probability estimates.
-  # - For h2o and randomForest, we pass along the number of trees (or a similar argument).
-  # - For spark, a seed is provided.
-  # - Other engines (e.g., aorsf, partykit) are simply set by name.
-  if (engine == "ranger") {
-    if (task == "classification") {
-      model_spec <- model_spec %>%
-        set_engine("ranger", probability = TRUE)
-    } else {
-      model_spec <- model_spec %>%
-        set_engine("ranger")
+    # Ensure censored is attached and survival engines are registered properly
+    if (!requireNamespace("censored", quietly = TRUE)) {
+      stop("Package 'censored' is required for survival random forest.", call. = FALSE)
     }
-  } else if (engine == "h2o") {
-    # For h2o, you might want to pass lambda_search or nthreads, etc.
+
+    # Force reload censored *before* parsnip’s model environment is cached
+    if (!"package:censored" %in% search()) {
+      suppressMessages({
+        if ("package:parsnip" %in% search()) {
+          detach("package:parsnip", unload = TRUE, character.only = TRUE)
+        }
+      })
+    }
+
+    # Build model spec
+    if (tuning) {
+      model_spec <- parsnip::rand_forest(
+        mtry  = tune(),
+        trees = tune(),
+        min_n = tune()
+      )
+    } else {
+      model_spec <- parsnip::rand_forest(
+        mtry  = defaults$mtry,
+        trees = defaults$trees,
+        min_n = defaults$min_n
+      )
+    }
+
     model_spec <- model_spec %>%
-      set_engine("h2o")
-  } else if (engine == "randomForest") {
-    # For randomForest, the argument is ntree instead of trees.
-    model_spec <- model_spec %>%
-      set_engine("randomForest")
-  } else if (engine == "spark") {
-    model_spec <- model_spec %>%
-      set_engine("spark", seed = 1234)
-  } else if (engine == "aorsf") {
-    model_spec <- model_spec %>%
-      set_engine("aorsf")
-  } else if (engine == "partykit") {
-    model_spec <- model_spec %>%
-      set_engine("partykit")
+      parsnip::set_mode("censored regression")
+
+    if (engine == "ranger") {
+      model_spec <- model_spec %>% parsnip::set_engine("ranger")
+    } else if (engine == "aorsf") {
+      if (!requireNamespace("aorsf", quietly = TRUE)) {
+        stop("Package 'aorsf' is required for this engine.", call. = FALSE)
+      }
+      model_spec <- model_spec %>% parsnip::set_engine("aorsf")
+    } else {
+      stop("Unsupported engine for survival random forest.", call. = FALSE)
+    }
   } else {
-    stop("Unsupported engine specified for rand_forest")
+
+    # Build model specification
+    if (tuning) {
+      model_spec <- parsnip::rand_forest(
+        mtry  = tune(),
+        trees = tune(),
+        min_n = tune()
+      )
+    } else {
+      model_spec <- parsnip::rand_forest(
+        mtry  = defaults$mtry,
+        trees = defaults$trees,
+        min_n = defaults$min_n
+      )
+    }
+
+    # Set model mode
+    model_spec <- model_spec %>%
+      parsnip::set_mode(task)
+
+    # Engine-specific parameter settings
+    if (engine == "ranger") {
+      if (task == "classification") {
+        model_spec <- model_spec %>%
+          parsnip::set_engine("ranger", probability = TRUE)
+      } else {
+        model_spec <- model_spec %>%
+          parsnip::set_engine("ranger")
+      }
+    } else if (engine == "h2o") {
+      model_spec <- model_spec %>%
+        parsnip::set_engine("h2o")
+    } else if (engine == "randomForest") {
+      model_spec <- model_spec %>%
+        parsnip::set_engine("randomForest")
+    } else if (engine == "spark") {
+      model_spec <- model_spec %>%
+        parsnip::set_engine("spark", seed = 1234)
+    } else if (engine == "partykit") {
+      model_spec <- model_spec %>%
+        parsnip::set_engine("partykit")
+    } else {
+      stop("Unsupported engine specified for rand_forest.", call. = FALSE)
+    }
   }
 
+  # Return a named list for consistency with fastml framework
   list(model_spec = model_spec)
 }
-
-
 
 #' Define bag_tree Model Specification
 #'

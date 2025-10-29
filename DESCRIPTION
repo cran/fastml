@@ -1,7 +1,7 @@
 Package: fastml
 Type: Package
 Title: Fast Machine Learning Model Training and Evaluation
-Version: 0.6.2
+Version: 0.7.0
 Authors@R: c(person("Selcuk", "Korkmaz", email="selcukorkmaz@gmail.com", role=c("aut", "cre"),
                     comment = c(ORCID = "0000-0003-4632-6850")), 
              person("Dincer", "Goksuluk", email="dincer.goksuluk@gmail.com", role="aut",
@@ -13,29 +13,31 @@ Description: Streamlines the training, evaluation, and comparison of multiple ma
             It offers performance metrics and visualization tools to facilitate efficient and effective machine learning workflows.
 Encoding: UTF-8
 License: MIT + file LICENSE
-URL: https://github.com/selcukorkmaz/fastml
+URL: https://selcukorkmaz.github.io/fastml-tutorial/,
+        https://github.com/selcukorkmaz/fastml
 BugReports: https://github.com/selcukorkmaz/fastml/issues
-LazyData: true
-Imports: recipes, dplyr, ggplot2, reshape2, rsample, parsnip, tune,
-        workflows, yardstick, tibble, rlang, dials, RColorBrewer,
+Imports: methods, recipes, dplyr, ggplot2, reshape2, rsample, parsnip,
+        tune, workflows, yardstick, tibble, rlang, dials, RColorBrewer,
         baguette, bonsai, discrim, doFuture, finetune, future, plsmod,
-        probably, viridisLite, DALEX, magrittr, patchwork, pROC,
-        janitor, stringr, DT, GGally, UpSetR, VIM, broom, dbscan,
-        ggpubr, gridExtra, htmlwidgets, kableExtra, moments, naniar,
-        plotly, scales, skimr, tidyr, knitr, rmarkdown, purrr, mice,
-        missForest
-Suggests: testthat (>= 3.0.0), C50, glmnet, xgboost, ranger, crayon,
-        kernlab, klaR, kknn, keras, lightgbm, rstanarm, mixOmics,
+        probably, viridisLite, DALEX, magrittr, pROC, janitor, stringr,
+        DT, UpSetR, VIM, broom, dbscan, ggpubr, gridExtra, htmlwidgets,
+        kableExtra, moments, naniar, plotly, scales, skimr, tidyr,
+        tidyselect, purrr, mice, missForest, survival, flexsurv,
+        rstpm2, iml, lime, survRM2, ceterisParibus, xgboost, knitr,
+        rmarkdown
+Suggests: testthat (>= 3.0.0), C50, ranger, aorsf, censored, crayon,
+        kernlab, klaR, kknn, keras, lightgbm, rstanarm, mixOmics, pdp,
+        patchwork, GGally, glmnet, agua, bslib, h2o, mlbench,
+        tidyverse,
 RoxygenNote: 7.3.2
 Config/testthat/edition: 3
 NeedsCompilation: no
-Packaged: 2025-07-24 13:52:50 UTC; selcukkorkmaz
+Packaged: 2025-10-29 19:08:23 UTC; selcukkorkmaz
 Author: Selcuk Korkmaz [aut, cre] (ORCID:
     <https://orcid.org/0000-0003-4632-6850>),
   Dincer Goksuluk [aut] (ORCID: <https://orcid.org/0000-0002-2752-7668>),
   Eda Karaismailoglu [aut] (ORCID:
     <https://orcid.org/0000-0003-3085-7809>)
 Maintainer: Selcuk Korkmaz <selcukorkmaz@gmail.com>
-Depends: R (>= 3.5.0)
 Repository: CRAN
-Date/Publication: 2025-07-24 14:30:08 UTC
+Date/Publication: 2025-10-29 19:40:07 UTC

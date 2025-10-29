@@ -1,3 +1,6 @@
+<img src="man/figures/fastml_hex.png" align="right" width="95"/>
+
+
 # fastml: Fast Machine Learning Model Training and Evaluation
 
 **fastml** is a streamlined R package designed to simplify the training, evaluation, and comparison of multiple machine learning models. It offers comprehensive data preprocessing, supports a wide range of algorithms with hyperparameter tuning, and provides performance metrics alongside visualization tools to facilitate efficient and effective machine learning workflows.
@@ -66,5 +69,30 @@ fastml supports both grid search and Bayesian optimization through the
 `"bayes"` for Bayesian hyperparameter search. The `tuning_iterations`
 parameter controls the number of iterations **only** when
 `tuning_strategy = "bayes"` and is ignored otherwise.
+
+## Explainability
+
+`fastexplain()` provides several ways to understand trained models. Set the
+`method` argument to choose an approach:
+
+```r
+# LIME explanations
+explain_lime(model)
+
+# ICE curves
+fastexplain(model, method = "ice", features = "Sepal.Length")
+
+# Accumulated Local Effects
+fastexplain(model, method = "ale", features = "Sepal.Length")
+
+# Surrogate tree
+fastexplain(model, method = "surrogate")
+
+# Interaction strength
+fastexplain(model, method = "interaction")
+
+# Counterfactual explanation for a single observation
+fastexplain(model, method = "counterfactual", observation = iris[1, ])
+```
 
 
