@@ -4,7 +4,15 @@
 \alias{counterfactual_explain}
 \title{Generate counterfactual explanations for a fastml model}
 \usage{
-counterfactual_explain(object, observation, ...)
+counterfactual_explain(
+  object,
+  observation,
+  variables = NULL,
+  positive_class = NULL,
+  event_class = NULL,
+  label_levels = NULL,
+  ...
+)
 }
 \arguments{
 \item{object}{A `fastml` object.}
@@ -12,21 +20,26 @@ counterfactual_explain(object, observation, ...)
 \item{observation}{A single observation (data frame with one row) to compute
 counterfactuals for.}
 
-\item{...}{Additional arguments passed to `ceterisParibus::calculate_counterfactuals`.}
+\item{variables}{Optional character vector of candidate variables to vary.
+Only numeric variables are used for counterfactual profiling.}
+
+\item{positive_class}{Optional string used to filter lines/points in the
+resulting profiles for classification tasks.}
+
+\item{event_class}{Optional event class indicator propagated from
+`fastml_prepare_explainer_inputs()` (kept for compatibility).}
+
+\item{label_levels}{Optional vector of label levels propagated from
+`fastml_prepare_explainer_inputs()` (kept for compatibility).}
+
+\item{...}{Additional arguments passed to `DALEX::predict_profile`.}
 }
 \value{
-A counterfactual explanation object.
+A list (returned invisibly) containing the DALEX profile, filtered
+  lines/points when `positive_class` is supplied, and the plotted object if
+  rendering succeeds.
 }
 \description{
-Uses the `ceterisParibus` package to compute counterfactuals for a given
-observation.
-}
-\examples{
-\dontrun{
-data(iris)
-iris <- iris[iris$Species != "setosa", ]
-iris$Species <- factor(iris$Species)
-model <- fastml(data = iris, label = "Species")
-counterfactual_explain(model, iris[1, ])
-}
+Uses DALEX ceteris-paribus profiles (`predict_profile`) to compute
+counterfactual-style what-if explanations for a given observation.
 }

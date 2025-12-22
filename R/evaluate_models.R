@@ -38,27 +38,31 @@
 #' @param at_risk_threshold Minimum proportion of subjects that must remain at
 #'   risk to define \eqn{t_{max}} when computing survival metrics such as the
 #'   integrated Brier score.
+#' @param precomputed_predictions Optional data frame or nested list of
+#'   previously generated predictions (per algorithm/engine) to reuse instead
+#'   of recomputing. This is mainly used when combining results across engines.
 #' @return A list with two elements:
 #'   \describe{
 #'     \item{performance}{A named list of performance metric tibbles for each model.}
 #'     \item{predictions}{A named list of data frames with columns including truth, predictions, and probabilities per model.}
 #'   }
 #' @export
-evaluate_models <- function(models,
-                            train_data,
-                            test_data,
-                            label,
-                            start_col,
-                            time_col,
-                            status_col,
-                            task,
-                            metric = NULL,
-                            event_class,
-                            eval_times = NULL,
-                            bootstrap_ci = TRUE,
-                            bootstrap_samples = 500,
-                            bootstrap_seed = 1234,
-                            at_risk_threshold = 0.1) {
+fastml_compute_holdout_results <- function(models,
+                                           train_data,
+                                           test_data,
+                                           label,
+                                           start_col = NULL,
+                                           time_col = NULL,
+                                           status_col = NULL,
+                                           task,
+                                           metric = NULL,
+                                           event_class,
+                                           eval_times = NULL,
+                                           bootstrap_ci = TRUE,
+                                           bootstrap_samples = 500,
+                                           bootstrap_seed = 1234,
+                                           at_risk_threshold = 0.1,
+                                           precomputed_predictions = NULL) {
   # Load required packages
   required_pkgs <- c("yardstick", "parsnip", "tune", "workflows",
                      "dplyr", "rlang", "tibble")
@@ -82,6 +86,23 @@ evaluate_models <- function(models,
   }
 
 
+  reuse_prediction <- function(algo_name, engine_name) {
+    if (is.null(precomputed_predictions)) {
+      return(NULL)
+    }
+    entry <- precomputed_predictions[[algo_name]]
+    if (is.null(entry)) {
+      return(NULL)
+    }
+    if (is.list(entry) && !is.data.frame(entry)) {
+      return(entry[[engine_name]])
+    }
+    if (is.data.frame(entry) && (is.null(engine_name) || is.na(engine_name))) {
+      return(entry)
+    }
+    NULL
+  }
+
   # Iterate over the models object. Check if the model is nested (i.e. a list of engines)
   for (algo in names(models)) {
     performance[[algo]] <- list()
@@ -92,6 +113,7 @@ evaluate_models <- function(models,
     if (is.list(models[[algo]]) && !inherits(models[[algo]], "workflow") && !inherits(models[[algo]], "tune_results") && !inherits(models[[algo]], "fastml_native_survival")) {
       for (eng in names(models[[algo]])) {
         model_obj <- models[[algo]][[eng]]
+        reused_preds <- reuse_prediction(algo, eng)
         result <- process_model(model_obj,
                                 model_id = paste(algo, eng, sep = "_"),
                                 task = task,
@@ -105,7 +127,8 @@ evaluate_models <- function(models,
                                 bootstrap_ci = bootstrap_ci,
                                 bootstrap_samples = bootstrap_samples,
                                 bootstrap_seed = bootstrap_seed,
-                                at_risk_threshold = at_risk_threshold)
+                                at_risk_threshold = at_risk_threshold,
+                                precomputed_predictions = reused_preds)
         if (!is.null(result)) {
           performance[[algo]][[eng]] <- result$performance
           predictions_list[[algo]][[eng]] <- result$predictions
@@ -122,6 +145,7 @@ evaluate_models <- function(models,
       } else {
         NA
       }
+      reused_preds <- reuse_prediction(algo, eng)
       result <- process_model(model_obj = models[[algo]],
                               model_id = algo,
                               task = task,
@@ -138,7 +162,8 @@ evaluate_models <- function(models,
                               bootstrap_ci = bootstrap_ci,
                               bootstrap_samples = bootstrap_samples,
                               bootstrap_seed = bootstrap_seed,
-                              at_risk_threshold = at_risk_threshold)
+                              at_risk_threshold = at_risk_threshold,
+                              precomputed_predictions = reused_preds)
 
 
 
@@ -149,6 +174,41 @@ evaluate_models <- function(models,
     }
   }
 
-  # Return both performance and predictions as a named list
-  return(list(performance = performance, predictions = predictions_list))
+  list(performance = performance, predictions = predictions_list)
+}
+
+evaluate_models <- function(models,
+                            train_data,
+                            test_data,
+                            label,
+                            start_col = NULL,
+                            time_col = NULL,
+                            status_col = NULL,
+                            task,
+                            metric = NULL,
+                            event_class,
+                            eval_times = NULL,
+                            bootstrap_ci = TRUE,
+                            bootstrap_samples = 500,
+                            bootstrap_seed = 1234,
+                            at_risk_threshold = 0.1,
+                            precomputed_predictions = NULL) {
+  fastml_compute_holdout_results(
+    models = models,
+    train_data = train_data,
+    test_data = test_data,
+    label = label,
+    start_col = start_col,
+    time_col = time_col,
+    status_col = status_col,
+    task = task,
+    metric = metric,
+    event_class = event_class,
+    eval_times = eval_times,
+    bootstrap_ci = bootstrap_ci,
+    bootstrap_samples = bootstrap_samples,
+    bootstrap_seed = bootstrap_seed,
+    at_risk_threshold = at_risk_threshold,
+    precomputed_predictions = precomputed_predictions
+  )
 }

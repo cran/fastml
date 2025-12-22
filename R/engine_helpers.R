@@ -60,6 +60,7 @@ availableMethods <- function(type = c("classification", "regression", "survival"
     } else {
       c(
         "rand_forest",
+        "rand_forest_survival",
         "cox_ph",
         "penalized_cox",
         "stratified_cox",
@@ -68,7 +69,8 @@ availableMethods <- function(type = c("classification", "regression", "survival"
         "royston_parmar",
         "parametric_surv",
         "piecewise_exp",
-        "xgboost"
+        "xgboost",
+        "xgboost_aft"
       )
     }
 
@@ -90,6 +92,9 @@ availableMethods <- function(type = c("classification", "regression", "survival"
 #' @export
 get_default_engine <- function(algo, task = NULL) {
   if (algo == "rand_forest" && !is.null(task) && task == "survival") {
+    return("aorsf")
+  }
+  if (algo == "rand_forest_survival" && !is.null(task) && task == "survival") {
     return("aorsf")
   }
   if (algo == "cox_ph" && !is.null(task) && task == "survival") {
@@ -122,6 +127,9 @@ get_default_engine <- function(algo, task = NULL) {
   if (algo == "xgboost" && !is.null(task) && task == "survival") {
     return("aft")
   }
+  if (algo == "xgboost_aft" && !is.null(task) && task == "survival") {
+    return("aft")
+  }
 
   switch(algo,
          "lightgbm" = "lightgbm",
@@ -138,7 +146,7 @@ get_default_engine <- function(algo, task = NULL) {
          "naive_Bayes" = "klaR",
          "mlp" = "nnet",
          "discrim_linear" = "MASS",
-         "discrim_quad" = "MASS",
+         "discrim_quad" = "sparsediscrim",
          "bag_tree" = "rpart",
          "elastic_net" = "glmnet",
          "bayes_glm" = "stan",
@@ -151,6 +159,9 @@ get_default_engine <- function(algo, task = NULL) {
          "survreg" = "survival",
          "royston_parmar" = "rstpm2",
          "deep_learning" = "keras",
+         "cox_ph" = "survival",
+         "survreg" = "survival",
+         "royston_parmar" = "rstpm2",
          stop("No default engine defined for algorithm: ", algo)
   )
 }

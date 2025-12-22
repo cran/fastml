@@ -123,6 +123,10 @@ fastml_xgb_predict_lp <- function(fit_obj, predictors) {
   }
   feature_names <- fit_obj$feature_names
   mat <- fastml_prepare_xgb_matrix(predictors, feature_names)
+  # Ensure no non-finite values are passed to xgboost
+  if (length(mat) > 0L) {
+    mat[!is.finite(mat)] <- 0
+  }
   if (nrow(mat) == 0 && length(feature_names) > 0) {
     return(rep(NA_real_, n_obs))
   }
@@ -154,6 +158,20 @@ fastml_xgb_predict_lp <- function(fit_obj, predictors) {
       predict(booster, newdata = mat, strict_shape = TRUE),
       error = function(e) NULL
     )
+    if (!is.null(pred_raw) && length(pred_raw) > 0) {
+      pred_raw <- as.numeric(pred_raw)
+      pred_raw[!is.finite(pred_raw) | pred_raw <= 0] <- NA_real_
+      pred <- log(pred_raw)
+    }
+  }
+
+  # If still missing, try an explicit DMatrix prediction before giving up.
+  if (is.null(pred) || length(pred) == 0 || all(!is.finite(pred))) {
+    dmat <- tryCatch(xgboost::xgb.DMatrix(data = mat), error = function(e) NULL)
+    pred_raw <- if (!is.null(dmat)) {
+      tryCatch(predict(booster, newdata = dmat, strict_shape = TRUE),
+               error = function(e) NULL)
+    } else NULL
     if (!is.null(pred_raw) && length(pred_raw) > 0) {
       pred_raw <- as.numeric(pred_raw)
       pred_raw[!is.finite(pred_raw) | pred_raw <= 0] <- NA_real_
@@ -793,13 +811,60 @@ predict_survival.workflow <- function(fit, newdata, times, ...) {
   if (length(times) == 0) {
     stop("No valid evaluation times supplied.")
   }
-  pred <- tryCatch(predict(fit, new_data = newdata, type = "survival", eval_time = times), error = function(e) NULL)
+
+  # Engines differ on the argument name for evaluation times (eval_time, time, times).
+  # Try a small cascade of signatures, capturing the last error for debugging.
+  extra_args <- list(...)
+  last_err <- NULL
+  attempt_predict <- function(arg_list) {
+    do.call(predict, c(list(fit), arg_list, extra_args))
+  }
+  try_sig <- function(arg_list) {
+    tryCatch(attempt_predict(arg_list), error = function(e) {
+      last_err <<- e$message
+      NULL
+    })
+  }
+
+  pred <- NULL
+  arg_variants <- list(
+    list(new_data = newdata, type = "survival", eval_time = times),
+    list(new_data = newdata, type = "survival", time = times),
+    list(new_data = newdata, type = "survival", times = times),
+    list(new_data = newdata, eval_time = times),
+    list(new_data = newdata, time = times),
+    list(new_data = newdata, times = times),
+    list(newdata = newdata, type = "survival", eval_time = times), # some engines still use `newdata`
+    list(newdata = newdata, type = "survival", time = times)
+  )
+
+  for (args in arg_variants) {
+    pred <- try_sig(args)
+    if (!is.null(pred)) break
+  }
+
+  # Single-time fallback for engines that only accept scalar time input
   if (is.null(pred) && length(times) == 1) {
-    pred <- tryCatch(predict(fit, new_data = newdata, type = "survival", eval_time = times[1]), error = function(e) NULL)
+    scalar_variants <- list(
+      list(new_data = newdata, type = "survival", eval_time = times[1]),
+      list(new_data = newdata, type = "survival", time = times[1]),
+      list(new_data = newdata, eval_time = times[1]),
+      list(newdata = newdata, type = "survival", eval_time = times[1])
+    )
+    for (args in scalar_variants) {
+      pred <- try_sig(args)
+      if (!is.null(pred)) break
+    }
   }
+
   if (is.null(pred)) {
-    stop("Underlying engine does not provide survival curve predictions.")
+    msg <- "Underlying engine does not provide survival curve predictions."
+    if (is.character(last_err) && nzchar(last_err)) {
+      msg <- paste0(msg, " Last error: ", last_err)
+    }
+    stop(msg)
   }
+
   fastml_align_survival_output(pred, times, nrow(newdata))
 }
 
