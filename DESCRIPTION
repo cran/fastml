@@ -2,7 +2,7 @@ Package: fastml
 Type: Package
 Title: Guarded Resampling Workflows for Safe and Automated Machine
         Learning in R
-Version: 0.7.5
+Version: 0.7.6
 Authors@R: c(person("Selcuk", "Korkmaz", email="selcukorkmaz@gmail.com", role=c("aut", "cre"),
                     comment = c(ORCID = "0000-0003-4632-6850")), 
              person("Dincer", "Goksuluk", email="dincer.goksuluk@gmail.com", role="aut",
@@ -18,7 +18,8 @@ Description: Provides a guarded resampling workflow for training and evaluating 
 	while keeping evaluation design explicit and user‑controlled.
 Encoding: UTF-8
 License: MIT + file LICENSE
-URL: https://github.com/selcukorkmaz/fastml
+URL: https://selcukorkmaz.github.io/fastml-tutorial/,
+        https://github.com/selcukorkmaz/fastml
 BugReports: https://github.com/selcukorkmaz/fastml/issues
 Depends: R (>= 4.1.0)
 Imports: stats, recipes, dplyr, ggplot2, reshape2, rsample, parsnip,
@@ -32,10 +33,10 @@ Suggests: testthat (>= 3.0.0), C50, ranger, aorsf, censored, crayon,
         patchwork, GGally, glmnet, DT, UpSetR, VIM, dbscan, ggpubr,
         gridExtra, htmlwidgets, kableExtra, moments, naniar, plotly,
         scales, skimr, sparsediscrim, knitr, rmarkdown
-RoxygenNote: 7.3.2
+RoxygenNote: 7.3.3
 Config/testthat/edition: 3
 NeedsCompilation: no
-Packaged: 2025-12-22 12:14:23 UTC; selcukkorkmaz
+Packaged: 2026-01-10 22:21:53 UTC; selcuk
 Author: Selcuk Korkmaz [aut, cre] (ORCID:
     <https://orcid.org/0000-0003-4632-6850>),
   Dincer Goksuluk [aut] (ORCID: <https://orcid.org/0000-0002-2752-7668>),
@@ -43,4 +44,4 @@ Author: Selcuk Korkmaz [aut, cre] (ORCID:
     <https://orcid.org/0000-0003-3085-7809>)
 Maintainer: Selcuk Korkmaz <selcukorkmaz@gmail.com>
 Repository: CRAN
-Date/Publication: 2025-12-22 12:40:02 UTC
+Date/Publication: 2026-01-10 22:50:02 UTC
