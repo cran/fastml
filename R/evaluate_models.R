@@ -20,6 +20,14 @@
 #' @param task Type of task: "classification", "regression", or "survival".
 #' @param metric The performance metric to optimize (e.g., "accuracy", "rmse").
 #' @param event_class A single string. Either "first" or "second" to specify which level of truth to consider as the "event".
+#' @param class_threshold For binary classification, controls how class probabilities
+#'   are converted into hard class predictions. Numeric values in (0, 1) set a fixed
+#'   threshold. The default `"auto"` tunes a threshold on the training data to maximize
+#'   F1; use `"model"` to keep the model's default threshold.
+#' @param multiclass_auc For multiclass ROC AUC, the averaging method to use:
+#'   `"macro"` (default, tidymodels) or `"macro_weighted"`. Macro weights each
+#'   class equally, while macro_weighted weights by class prevalence and can
+#'   change model rankings on imbalanced data.
 #' @importFrom dplyr filter bind_rows pull mutate select bind_cols
 #' @importFrom yardstick metric_set accuracy kap roc_auc sens spec precision f_meas rmse rsq mae
 #' @importFrom workflows pull_workflow_spec pull_workflow_preprocessor workflow add_model add_recipe
@@ -38,6 +46,12 @@
 #' @param at_risk_threshold Minimum proportion of subjects that must remain at
 #'   risk to define \eqn{t_{max}} when computing survival metrics such as the
 #'   integrated Brier score.
+#' @param survival_metric_convention Character string specifying which survival
+#'   metric conventions to follow. `"fastml"` (default) uses fastml's internal
+#'   defaults for evaluation horizons and t_max. `"tidymodels"` uses
+#'   `eval_times` as the explicit evaluation grid and applies yardstick-style
+#'   Brier/IBS normalization; when `eval_times` is `NULL`, time-dependent Brier
+#'   metrics are omitted.
 #' @param precomputed_predictions Optional data frame or nested list of
 #'   previously generated predictions (per algorithm/engine) to reuse instead
 #'   of recomputing. This is mainly used when combining results across engines.
@@ -59,13 +73,17 @@ fastml_compute_holdout_results <- function(models,
                                            task,
                                            metric = NULL,
                                            event_class,
+                                           class_threshold = "auto",
                                            eval_times = NULL,
                                            bootstrap_ci = TRUE,
                                            bootstrap_samples = 500,
                                            bootstrap_seed = 1234,
                                            at_risk_threshold = 0.1,
+                                           survival_metric_convention = "fastml",
                                            precomputed_predictions = NULL,
-                                           summaryFunction = NULL) {
+                                           summaryFunction = NULL,
+                                           multiclass_auc = "macro") {
+  survival_metric_convention <- fastml_normalize_survival_convention(survival_metric_convention)
   # Load required packages
   required_pkgs <- c("yardstick", "parsnip", "tune", "workflows",
                      "dplyr", "rlang", "tibble")
@@ -123,6 +141,7 @@ fastml_compute_holdout_results <- function(models,
                                 test_data = test_data,
                                 label = label,
                                 event_class = event_class,
+                                class_threshold = class_threshold,
                                 engine = eng,
                                 train_data = train_data,
                                 metric = metric,
@@ -132,7 +151,9 @@ fastml_compute_holdout_results <- function(models,
                                 bootstrap_samples = bootstrap_samples,
                                 bootstrap_seed = bootstrap_seed,
                                 at_risk_threshold = at_risk_threshold,
-                                precomputed_predictions = reused_preds)
+                                survival_metric_convention = survival_metric_convention,
+                                precomputed_predictions = reused_preds,
+                                multiclass_auc = multiclass_auc)
         if (!is.null(result)) {
           performance[[algo]][[eng]] <- result$performance
           predictions_list[[algo]][[eng]] <- result$predictions
@@ -159,6 +180,7 @@ fastml_compute_holdout_results <- function(models,
                               time_col = time_col,
                               status_col = status_col,
                               event_class = event_class,
+                              class_threshold = class_threshold,
                               engine = eng,
                               train_data = train_data,
                               metric = metric,
@@ -168,7 +190,9 @@ fastml_compute_holdout_results <- function(models,
                               bootstrap_samples = bootstrap_samples,
                               bootstrap_seed = bootstrap_seed,
                               at_risk_threshold = at_risk_threshold,
-                              precomputed_predictions = reused_preds)
+                              survival_metric_convention = survival_metric_convention,
+                              precomputed_predictions = reused_preds,
+                              multiclass_auc = multiclass_auc)
 
 
 
@@ -205,13 +229,16 @@ evaluate_models <- function(models,
                             task,
                             metric = NULL,
                             event_class,
+                            class_threshold = "auto",
                             eval_times = NULL,
                             bootstrap_ci = TRUE,
                             bootstrap_samples = 500,
                             bootstrap_seed = 1234,
                             at_risk_threshold = 0.1,
+                            survival_metric_convention = "fastml",
                             precomputed_predictions = NULL,
-                            summaryFunction = NULL) {
+                            summaryFunction = NULL,
+                            multiclass_auc = "macro") {
   fastml_compute_holdout_results(
     models = models,
     train_data = train_data,
@@ -223,12 +250,15 @@ evaluate_models <- function(models,
     task = task,
     metric = metric,
     event_class = event_class,
+    class_threshold = class_threshold,
     eval_times = eval_times,
     bootstrap_ci = bootstrap_ci,
     bootstrap_samples = bootstrap_samples,
     bootstrap_seed = bootstrap_seed,
     at_risk_threshold = at_risk_threshold,
+    survival_metric_convention = survival_metric_convention,
     precomputed_predictions = precomputed_predictions,
-    summaryFunction = summaryFunction
+    summaryFunction = summaryFunction,
+    multiclass_auc = multiclass_auc
   )
 }

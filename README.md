@@ -5,7 +5,7 @@
 **fastml** is an R package for training, evaluating, and comparing machine learning models with a guarded resampling workflow.  
 Rather than introducing new learning algorithms, fastml focuses on **reducing leakage risk** by keeping preprocessing, model fitting, and evaluation aligned within supported resampling paths.
 
-In fastml, *“fast” refers to the rapid construction of statistically valid workflows*, not to computational shortcuts. By eliminating entire classes of user-induced errors—most notably preprocessing leakage—fastml allows practitioners to obtain reliable performance estimates with minimal configuration.
+In fastml, *fast* refers to the rapid construction of statistically valid workflows, not to computational shortcuts. By eliminating entire classes of user-induced errors - most notably preprocessing leakage - fastml allows practitioners to obtain reliable performance estimates with minimal configuration.
 
 ## Core Principles
 
@@ -34,6 +34,9 @@ In fastml, *“fast” refers to the rapid construction of statistically valid w
 
 - **Consistent performance evaluation**  
   Metrics such as Accuracy, ROC AUC, Sensitivity, Specificity, Precision, and F1 are computed without leakage.
+
+- **Multiclass ROC AUC averaging**  
+  Macro averaging (tidymodels default) weights each class equally. Set `multiclass_auc = "macro_weighted"` to weight by class prevalence; this can change model rankings on imbalanced data, so keep the choice consistent across runs.
 
 - **Visualization and comparison tools**  
   Built-in plots facilitate comparison across models while preserving statistical validity.
@@ -70,6 +73,7 @@ Here's a simple workflow to get you started with fastml:
 
 ```r
 library(fastml)
+library(dplyr)
 
 # Example dataset
 data(iris)
@@ -102,18 +106,20 @@ plot(fit, type = "calibration")
 
 Hyperparameter tuning is supported via:
 
-- `grid` — regular grid search
+- `grid` - regular grid search
 
-- `bayes` — Bayesian optimization
+- `bayes` - Bayesian optimization
 
 ```r
-fastml(
+fit <- fastml(
   data = iris_binary,
   label = "Species",
   algorithms = c("rand_forest", "logistic_reg"),
   tuning_strategy = "bayes",
   tuning_iterations = 20
 )
+
+summary(fit)
 ```
 
 `tuning_iterations` is used only for Bayesian optimization.
@@ -161,7 +167,7 @@ It summarizes distributions, missingness, correlations, and basic structure with
 fastexplore(iris, label = "Species")
 ```
 
-This function is decoupled from fastml’s guarded resampling core and does not influence model evaluation unless its outputs are explicitly used in later modeling calls.
+This function is decoupled from fastml's guarded resampling core and does not influence model evaluation unless its outputs are explicitly used in later modeling calls.
 
 ## Scope
 

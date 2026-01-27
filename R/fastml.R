@@ -46,7 +46,15 @@
 #'   successive resamples when \code{resampling_method = "rolling_origin"}.
 #' @param outer_folds Positive integer giving the number of outer folds to use when
 #'   \code{resampling_method = "nested_cv"} and no custom \code{resamples} object is supplied.
-#' @param event_class A single string. Either "first" or "second" to specify which level of truth to consider as the "event". Default is "first".
+#' @param event_class A single string. Either "first" or "second" to specify which
+#'   level of the binary outcome factor to treat as the positive class (the "event").
+#'   For binary classification, "first" treats the first factor level as the positive
+#'   class, "second" treats the second level as positive. Use
+#'   \code{levels(your_data$outcome)} to check level order before training. Default is "first".
+#' @param multiclass_auc For multiclass ROC AUC, the averaging method to use:
+#'   `"macro"` (default, tidymodels) or `"macro_weighted"`. Macro weights each
+#'   class equally, while macro_weighted weights by class prevalence and can
+#'   change model rankings on imbalanced data.
 #' @param exclude A character vector specifying the names of the columns to be excluded from the training process.
 #' @param recipe A user-defined \code{recipe} object for custom preprocessing. If provided, internal recipe steps (imputation, encoding, scaling) are skipped.
 #' @param tune_params A named list of tuning ranges for each algorithm and engine
@@ -60,8 +68,24 @@
 #'   \code{list(rand_forest = list(ranger = list(importance = "impurity")))}).
 #'   These arguments are distinct from \code{tune_params}, which define ranges of
 #'   hyperparameters to explore during tuning. Default is an empty list.
-#' @param metric The performance metric to optimize during training.
+#' @param metric The performance metric to optimize during training. For
+#'   classification, options include \code{"accuracy"}, \code{"roc_auc"},
+#'   \code{"logloss"}, \code{"brier_score"}, and \code{"ece"} (plus other class metrics).
+#' @param class_threshold For binary classification, controls how class probabilities
+#'   are converted into hard class predictions during holdout evaluation. Numeric
+#'   values in (0, 1) set a fixed threshold. The default \code{"auto"} tunes a
+#'   threshold on the training data to maximize F1; use \code{"model"} to keep
+#'   the model's default threshold.
 #' @param algorithm_engines A named list specifying the engine to use for each algorithm.
+#' @param use_parsnip_defaults Logical. If \code{TRUE}, fastml uses parsnip's default
+#'   engines instead of fastml's optimized defaults. This provides compatibility with
+#'   standard tidymodels behavior. If \code{FALSE} (default), fastml uses its own
+#'   curated engine defaults which may differ from parsnip. When engines differ,
+#'   a warning is issued unless \code{algorithm_engines} explicitly specifies the engine.
+#'   Use \code{print_default_differences()} to see all differences.
+#' @param warn_engine_defaults Logical. If \code{TRUE} (default), warns when fastml's
+#'   default engine differs from parsnip's default. Set to \code{FALSE} to suppress
+#'   these warnings. Warnings are only shown once per algorithm per session.
 #' @param n_cores An integer specifying the number of CPU cores to use for parallel processing. Default is \code{1}.
 #' @param stratify Logical indicating whether to use stratified sampling when splitting the data. Only applied to random holdout splitting. Default is \code{TRUE} for classification and \code{FALSE} for regression.
 #' @param impute_method Method for handling missing values. Options include:
@@ -78,8 +102,9 @@
 #' @param encode_categoricals Logical indicating whether to encode categorical variables. Default is \code{TRUE}.
 #' @param scaling_methods Vector of scaling methods to apply. Default is \code{c("center", "scale")}.
 #' @param balance_method Method to handle class imbalance. One of \code{"none"},
-#'   \code{"upsample"}, or \code{"downsample"}. Applied to the training set for
-#'   classification tasks. Default is \code{"none"}.
+#'   \code{"upsample"}, or \code{"downsample"}. Applied inside the preprocessing
+#'   recipe so each resampling split is balanced independently (requires the
+#'   \code{themis} package when enabled). Default is \code{"none"}.
 #' @param resamples Optional rsample object providing custom resampling splits.
 #'   If supplied, \code{resampling_method}, \code{folds}, and \code{repeats} are
 #'   ignored.
@@ -98,21 +123,55 @@
 #' @param tuning_iterations Number of iterations for Bayesian tuning. Ignored when
 #'   \code{tuning_strategy} is not \code{"bayes"}. Validation of this argument only
 #'   occurs for the Bayesian strategy. Default is \code{10}.
+#' @param tuning_complexity Character string specifying a tuning complexity preset
+#'   that controls grid density and parameter range width. One of:
+#'   \describe{
+#'     \item{\code{"quick"}}{Minimal tuning (2 levels/param, ~32 combinations for 5 params).
+#'       Best for: prototyping, debugging, time-constrained scenarios.}
+#'     \item{\code{"balanced"}}{Standard tuning (3 levels/param, ~243 combinations).
+#'       Best for: most production use cases. This is the default.}
+#'     \item{\code{"thorough"}}{Comprehensive tuning (5 levels/param, ~3,125 combinations).
+#'       Best for: final model selection, publications.}
+#'     \item{\code{"exhaustive"}}{Maximum coverage (7 levels/param, ~16,807 combinations).
+#'       Best for: research, competitions. Consider Bayesian tuning instead.}
+#'   }
+#'   See \code{\link{print_tuning_presets}} for detailed comparison.
+#'   Ignored if \code{grid_levels} is explicitly set.
+#' @param grid_levels Integer specifying the number of levels per parameter for
+#'   grid search. Higher values create denser grids but increase computation time
+#'   exponentially (grid size = levels^n_params). Typical values:
+#'   \itemize{
+#'     \item 2: Very fast, minimal coverage
+#'     \item 3: Balanced (default via \code{tuning_complexity = "balanced"})
+#'     \item 5: Thorough coverage
+#'     \item 7+: Exhaustive (consider Bayesian tuning instead)
+#'   }
+#'   If \code{NULL} (default), determined by \code{tuning_complexity}.
 #' @param early_stopping Logical indicating whether to use early stopping in Bayesian tuning methods (if supported). Default is \code{FALSE}.
 #' @param adaptive Logical indicating whether to use adaptive/racing methods for tuning. Default is \code{FALSE}.
 #' @param learning_curve Logical. If TRUE, generate learning curves (performance vs. training size).
 #' @param seed An integer value specifying the random seed for reproducibility.
+#'   fastml also configures parallel backends for deterministic RNG streams when
+#'   possible; some external engines (e.g., h2o, spark, keras) may still be
+#'   nondeterministic and will emit a warning.
 #' @param verbose Logical; if TRUE, prints progress messages during the training
 #'   and evaluation process.
 #' @param eval_times Optional numeric vector of evaluation horizons for survival
 #'   models. When \code{NULL}, defaults to the median and 75th percentile of the
 #'   observed follow-up times (rounded to the dataset's time unit).
+#' @param survival_metric_convention Character string specifying which survival
+#'   metric conventions to follow. `"fastml"` (default) uses fastml's internal
+#'   defaults for evaluation horizons and t_max. `"tidymodels"` uses
+#'   `eval_times` as the explicit evaluation grid and applies yardstick-style
+#'   Brier/IBS normalization; when `eval_times` is `NULL`, time-dependent Brier
+#'   metrics are omitted.
 #' @param bootstrap_ci Logical indicating whether bootstrap confidence intervals
 #'   should be computed for performance metrics. Applies to all task types.
 #' @param bootstrap_samples Integer giving the number of bootstrap resamples to
 #'   use when \code{bootstrap_ci = TRUE}. Defaults to 500.
 #' @param bootstrap_seed Optional seed passed to the bootstrap procedure used to
-#'   estimate confidence intervals.
+#'   estimate confidence intervals. When omitted, defaults to `seed` for
+#'   reproducible intervals; set to `NULL` to allow random bootstrap draws.
 #' @param at_risk_threshold Numeric value between 0 and 1 used for survival
 #'   metrics to determine the last follow-up time (\eqn{t_{max}}). The maximum
 #'   time is set to the largest observed time where at least this proportion of
@@ -121,17 +180,79 @@
 #'   preprocessing hooks and records potentially unsafe behaviour (such as global
 #'   environment access or file I/O) while flagging the run as potentially
 #'   unsafe.
+#' @param store_fold_models Logical. If \code{TRUE}, stores the models trained
+#'   on each cross-validation fold (memory intensive). This enables
+#'   \code{\link{explain_stability}} to compute feature importance across folds
+#'   and assess explanation stability. Default is \code{FALSE}.
 #' @importFrom magrittr %>%
 #' @importFrom rsample initial_split training testing
 #' @importFrom recipes recipe step_impute_median step_impute_knn step_impute_bag step_naomit step_dummy step_center step_scale prep bake all_numeric_predictors all_predictors all_nominal_predictors all_outcomes step_zv step_rm step_novel step_unknown
-#' @importFrom dplyr filter pull rename_with mutate across where select all_of group_by sample_n ungroup
+#' @importFrom dplyr filter pull rename_with mutate across where select all_of
 #' @importFrom rlang sym .data
 #' @importFrom stats as.formula complete.cases
-#' @importFrom doFuture registerDoFuture
-#' @importFrom future plan multisession sequential
 #' @importFrom janitor make_clean_names
 #' @importFrom stringr str_detect
 #' @importFrom purrr flatten
+#' @details
+#' Model selection is based exclusively on resampling metrics (cross-validation
+#' or nested CV). The holdout split is reserved for final performance
+#' estimation and is never used to choose the best model, mirroring
+#' \code{tidymodels::last_fit()} semantics.
+#'
+#' For multiclass ROC AUC, fastml defaults to macro averaging (tidymodels).
+#' Macro treats each class equally, while macro_weighted weights by class
+#' prevalence and can change model rankings on imbalanced data. Keep the same
+#' setting when comparing runs.
+#'
+#' ## Tuning: Speed vs Robustness Trade-offs
+#'
+#' Hyperparameter tuning involves a fundamental trade-off between computational
+#' cost and the likelihood of finding optimal hyperparameters. fastml provides
+#' presets via \code{tuning_complexity} to make this trade-off explicit:
+#'
+#' \tabular{lllll}{
+#'   \strong{Level} \tab \strong{Grid Size*} \tab \strong{Time} \tab \strong{Quality} \tab \strong{Use Case} \cr
+#'   quick \tab ~32 \tab ~1x \tab Low \tab Prototyping, debugging \cr
+#'   balanced \tab ~243 \tab ~10x \tab Medium \tab Most production use \cr
+#'   thorough \tab ~3,125 \tab ~100x \tab High \tab Final models, papers \cr
+#'   exhaustive \tab ~16,807 \tab ~1000x \tab Very High \tab Research, competitions \cr
+#' }
+#' *Grid size shown for 5 tunable parameters (levels^5)
+#'
+#' **Recommendations:**
+#' \itemize{
+#'   \item Start with \code{tuning_complexity = "quick"} during development
+#'   \item Use \code{"balanced"} (default) for most production pipelines
+#'   \item Switch to \code{"thorough"} for final model selection
+#'   \item Consider \code{tuning_strategy = "bayes"} instead of exhaustive grid search
+#'   \item Enable \code{adaptive = TRUE} for early stopping of poor configurations
+#' }
+#'
+#' Use \code{\link{print_tuning_presets}} to see all presets and
+#' \code{\link{estimate_tuning_time}} to estimate runtime before starting.
+#'
+#' @section Factor Level Warning:
+#' For binary classification, the interpretation of metrics like sensitivity, specificity,
+#' and ROC AUC depends on which factor level is treated as the "positive" class (the event
+#' of interest). The \code{event_class} parameter controls this:
+#' \itemize{
+#'   \item \code{"first"} (default): The first factor level is treated as positive
+#'   \item \code{"second"}: The second factor level is treated as positive
+#' }
+#'
+#' \strong{Important:} Recipe preprocessing steps like \code{step_other()} or
+#' \code{step_unknown()} can modify factor levels, potentially changing which level
+#' is "first" or "second". Always verify factor levels after preprocessing.
+#'
+#' To ensure consistent behavior, explicitly set factor levels before calling fastml:
+#' \preformatted{
+#' # Ensure "positive" is the second level (event_class = "second")
+#' data$outcome <- factor(data$outcome, levels = c("negative", "positive"))
+#'
+#' # Or ensure "positive" is the first level (event_class = "first")
+#' data$outcome <- factor(data$outcome, levels = c("positive", "negative"))
+#' }
+#'
 #' @return An object of class \code{fastml} containing the best model, performance metrics, and other information.
 #' @examples
 #' \donttest{
@@ -186,7 +307,10 @@ fastml <- function(data = NULL,
                    tune_params = NULL,
                    engine_params = list(),
                    metric = NULL,
+                   class_threshold = "auto",
                    algorithm_engines = NULL,
+                   use_parsnip_defaults = FALSE,
+                   warn_engine_defaults = TRUE,
                    n_cores = 1,
                    stratify = TRUE,
                    impute_method = "error",
@@ -198,25 +322,61 @@ fastml <- function(data = NULL,
                    use_default_tuning = FALSE,
                    tuning_strategy = "grid",
                    tuning_iterations = 10,
+                   tuning_complexity = "balanced",
+                   grid_levels = NULL,
                    early_stopping = FALSE,
                    adaptive = FALSE,
                    learning_curve = FALSE,
                    seed = 123,
                    verbose = FALSE,
                    eval_times = NULL,
+                   survival_metric_convention = "fastml",
                    bootstrap_ci = TRUE,
                    bootstrap_samples = 500,
                    bootstrap_seed = NULL,
                    at_risk_threshold = 0.1,
-                   audit_mode = FALSE) {
+                   audit_mode = FALSE,
+                   multiclass_auc = "macro",
+                   store_fold_models = FALSE) {
 
   resampling_method_missing <- missing(resampling_method)
+  bootstrap_seed_missing <- missing(bootstrap_seed)
   audit_env <- fastml_init_audit_env(audit_mode)
 
   set.seed(seed)
+  if (bootstrap_seed_missing) {
+    bootstrap_seed <- seed
+  }
 
   task <- match.arg(task, c("auto", "classification", "regression", "survival"))
   tuning_strategy <- match.arg(tuning_strategy, c("grid", "bayes", "none"))
+  tuning_complexity <- match.arg(tuning_complexity, c("balanced", "quick", "thorough", "exhaustive"))
+
+  # Resolve grid_levels from tuning_complexity if not explicitly set
+  if (is.null(grid_levels)) {
+    tuning_config <- get_tuning_complexity(tuning_complexity)
+    grid_levels <- tuning_config$grid_levels
+    # Also update tuning_iterations for Bayesian if using complexity preset
+    if (tuning_strategy == "bayes" && missing(tuning_iterations)) {
+      tuning_iterations <- tuning_config$bayes_iterations
+    }
+    if (verbose) {
+      message(sprintf("Using '%s' tuning complexity: %d grid levels, %d Bayesian iterations",
+                      tuning_complexity, grid_levels, tuning_config$bayes_iterations))
+    }
+  } else {
+    # Validate user-provided grid_levels
+    if (!is.numeric(grid_levels) || length(grid_levels) != 1 ||
+        grid_levels < 2 || grid_levels != as.integer(grid_levels)) {
+      stop("'grid_levels' must be an integer >= 2.", call. = FALSE)
+    }
+    grid_levels <- as.integer(grid_levels)
+    if (verbose) {
+      message(sprintf("Using custom grid_levels: %d", grid_levels))
+    }
+  }
+
+  survival_metric_convention <- fastml_normalize_survival_convention(survival_metric_convention)
   if (is.null(resampling_method)) {
     resampling_method <- "none"
   } else {
@@ -445,6 +605,10 @@ fastml <- function(data = NULL,
   }
 
   split_holdout <- function(df, use_strata = FALSE) {
+    seed_val <- fastml_normalize_seed(seed)
+    if (!is.null(seed_val)) {
+      set.seed(seed_val)
+    }
     if (use_strata && !identical(holdout_mode, "random")) {
       warning(
         "Stratified holdout is only supported for random splitting; proceeding without stratification.",
@@ -550,6 +714,28 @@ fastml <- function(data = NULL,
     if (!is.null(impute_method) && impute_method == "error" && anyNA(data)) {
       stop("Data contains NAs and 'impute_method = \"error\"'. Handle missing values first.")
     }
+
+    integer_cols <- names(data)[vapply(data, is.integer, logical(1))]
+    label_cols <- if (task == "survival") label else label
+    integer_predictors <- setdiff(integer_cols, label_cols)
+    if (length(integer_predictors) > 0) {
+      low_cardinality <- integer_predictors[vapply(
+        data[integer_predictors],
+        function(col) length(unique(col[!is.na(col)])) <= 10,
+        logical(1)
+      )]
+      if (length(low_cardinality) > 0) {
+        warning(
+          paste(
+            "Integer predictors are treated as numeric.",
+            "If any of these are categorical codes, convert them to factor before calling fastml:",
+            paste(low_cardinality, collapse = ", ")
+          ),
+          call. = FALSE
+        )
+      }
+    }
+
     data <- data %>%
       dplyr::mutate(
         dplyr::across(where(is.character), as.factor),
@@ -571,27 +757,18 @@ fastml <- function(data = NULL,
     test_data  <- split_result$test_data
   }
 
-  if (task == "classification" && balance_method != "none") {
-    label_sym <- rlang::sym(label)
-    class_counts <- table(train_data[[label]])
-    if (balance_method == "upsample") {
-      max_n <- max(class_counts)
-      train_data <- train_data %>%
-        dplyr::group_by(!!label_sym) %>%
-        dplyr::sample_n(max_n, replace = TRUE) %>%
-        dplyr::ungroup()
-    } else if (balance_method == "downsample") {
-      min_n <- min(class_counts)
-      train_data <- train_data %>%
-        dplyr::group_by(!!label_sym) %>%
-        dplyr::sample_n(min_n, replace = FALSE) %>%
-        dplyr::ungroup()
-    }
-  }
-
   if (task == "survival") {
     if (!(length(label) %in% c(2, 3))) {
       stop("For survival tasks, 'label' must contain the time/status columns present in the data (length 2 or 3).")
+    }
+    if (length(label) == 3) {
+      stop(
+        paste(
+          "Start/stop (left-truncated) survival data are not supported for evaluation in fastml.",
+          "Provide right-censored inputs as c(time, status) or evaluate externally."
+        ),
+        call. = FALSE
+      )
     }
     outcome_cols_check <- if (length(label) == 2) label else label[1:3]
     drop_missing_outcomes <- function(df, which_set) {
@@ -693,10 +870,12 @@ fastml <- function(data = NULL,
     }
   }
 
+  multiclass_auc <- fastml_normalize_multiclass_auc(multiclass_auc)
+
   # Set default metric now that task has been resolved and validate it
   if (is.null(metric)) {
     metric <- if (task == "classification") {
-      "accuracy"
+      "roc_auc"
     } else if (task == "regression") {
       "rmse"
     } else {
@@ -704,7 +883,7 @@ fastml <- function(data = NULL,
     }
   }
 
-  allowed_metrics_classification <- c("accuracy", "kap", "sens", "spec", "precision", "f_meas", "roc_auc")
+  allowed_metrics_classification <- c("accuracy", "kap", "sens", "spec", "precision", "f_meas", "roc_auc", "logloss", "brier_score", "ece")
   allowed_metrics_regression <- c("rmse", "rsq", "mae")
   allowed_metrics_survival <- c("c_index", "uno_c", "ibs", "rmst_diff")
 
@@ -897,23 +1076,9 @@ fastml <- function(data = NULL,
   ensure_columns_present(reference_resample_data, block_col, "`block_col`")
   ###############################################################################
 
-  # Set up parallel processing using future
-  if (n_cores > 1) {
-    if (!requireNamespace("doFuture", quietly = TRUE)) {
-      stop("The 'doFuture' package is required for parallel processing but is not installed.")
-    }
-    if (!requireNamespace("future", quietly = TRUE)) {
-      stop("The 'future' package is required but is not installed.")
-    }
-    registerDoFuture()
-    plan(multisession, workers = n_cores)
-    on.exit(plan(sequential), add = TRUE)
-  } else {
-    if (!requireNamespace("future", quietly = TRUE)) {
-      stop("The 'future' package is required but is not installed.")
-    }
-    plan(sequential)
-  }
+  # Set up parallel processing using future and restore it on exit.
+  parallel_ctx <- fastml_setup_parallel(n_cores = n_cores, seed = seed)
+  on.exit(parallel_ctx$restore(), add = TRUE)
 
   ########################################################################
   # Build or use recipe if user hasn't provided it
@@ -991,43 +1156,83 @@ fastml <- function(data = NULL,
     # do not prep yet
   }
 
+  if (task == "classification" && balance_method != "none") {
+    if (!requireNamespace("themis", quietly = TRUE)) {
+      stop("The 'themis' package is required for balance_method = \"upsample\" or \"downsample\".")
+    }
+
+    has_balance_step <- FALSE
+    if (!is.null(recipe$steps) && length(recipe$steps) > 0) {
+      has_balance_step <- any(vapply(recipe$steps, inherits, logical(1), "step_upsample")) ||
+        any(vapply(recipe$steps, inherits, logical(1), "step_downsample"))
+    }
+
+    if (has_balance_step) {
+      warning(
+        "balance_method was ignored because the recipe already includes a sampling step.",
+        call. = FALSE
+      )
+    } else if (balance_method == "upsample") {
+      recipe <- recipe %>%
+        themis::step_upsample(all_outcomes(), seed = seed, skip = TRUE)
+    } else if (balance_method == "downsample") {
+      recipe <- recipe %>%
+        themis::step_downsample(all_outcomes(), seed = seed, skip = TRUE)
+    } else {
+      stop("Invalid balance_method. Use \"none\", \"upsample\", or \"downsample\".")
+    }
+  }
+
   if (verbose) message("Training models: ", paste(algorithms, collapse = ", "))
 
-  models <- train_models(
-    train_data = train_data,
-    label = label,
-    task = task,
-    algorithms = algorithms,
-    resampling_method = resampling_method,
-    folds = folds,
-    repeats = repeats,
-    group_cols = group_cols,
-    block_col = block_col,
-    block_size = block_size,
-    initial_window = initial_window,
-    assess_window = assess_window,
-    skip = skip,
-    outer_folds = outer_folds,
-    resamples = resamples,
-    tune_params = tune_params,
-    engine_params = engine_params,
-    metric = metric,
-    summaryFunction = summaryFunction,
-    seed = seed,
-    recipe = recipe,
-    use_default_tuning = use_default_tuning,
-    tuning_strategy = tuning_strategy,
-    tuning_iterations = tuning_iterations,
-    early_stopping = early_stopping,
-    adaptive = adaptive,
-    algorithm_engines = algorithm_engines,
-    event_class = event_class,
-    start_col = start_col,
-    time_col = time_col,
-    status_col = status_col,
-    eval_times = eval_times,
-    at_risk_threshold = at_risk_threshold,
-    audit_env = audit_env
+  models <- withCallingHandlers(
+    train_models(
+      train_data = train_data,
+      label = label,
+      task = task,
+      algorithms = algorithms,
+      resampling_method = resampling_method,
+      folds = folds,
+      repeats = repeats,
+      group_cols = group_cols,
+      block_col = block_col,
+      block_size = block_size,
+      initial_window = initial_window,
+      assess_window = assess_window,
+      skip = skip,
+      outer_folds = outer_folds,
+      resamples = resamples,
+      tune_params = tune_params,
+      engine_params = engine_params,
+      metric = metric,
+      summaryFunction = summaryFunction,
+      seed = seed,
+      recipe = recipe,
+      use_default_tuning = use_default_tuning,
+      tuning_strategy = tuning_strategy,
+      tuning_iterations = tuning_iterations,
+      tuning_complexity = tuning_complexity,
+      grid_levels = grid_levels,
+      early_stopping = early_stopping,
+      adaptive = adaptive,
+      algorithm_engines = algorithm_engines,
+      use_parsnip_defaults = use_parsnip_defaults,
+      warn_engine_defaults = warn_engine_defaults,
+      n_cores = n_cores,
+      verbose = verbose,
+      event_class = event_class,
+      class_threshold = class_threshold,
+      start_col = start_col,
+      time_col = time_col,
+      status_col = status_col,
+      eval_times = eval_times,
+      at_risk_threshold = at_risk_threshold,
+      survival_metric_convention = survival_metric_convention,
+      audit_env = audit_env,
+      multiclass_auc = multiclass_auc,
+      store_fold_models = store_fold_models
+    ),
+    warning = fastml_muffle_foreach_warning
   )
 
   resampling_results <- attr(models, "guarded_resampling")
@@ -1058,12 +1263,15 @@ fastml <- function(data = NULL,
                                                task,
                                                metric,
                                                event_class,
+                                               class_threshold = class_threshold,
                                                eval_times = eval_times,
                                                bootstrap_ci = bootstrap_ci,
                                                bootstrap_samples = bootstrap_samples,
                                                bootstrap_seed = bootstrap_seed,
                                                at_risk_threshold = at_risk_threshold,
-                                               summaryFunction = summaryFunction)
+                                               survival_metric_convention = survival_metric_convention,
+                                               summaryFunction = summaryFunction,
+                                               multiclass_auc = multiclass_auc)
   performance <- eval_output$performance
   predictions <- eval_output$predictions
 
@@ -1172,6 +1380,24 @@ fastml <- function(data = NULL,
     resampling_results <- resampling_named
   }
 
+  if (!is.null(resampling_results)) {
+    resampling_results <- lapply(resampling_results, function(entry) {
+      if (!is.list(entry) || inherits(entry, "data.frame")) {
+        return(entry)
+      }
+      folds_tbl <- entry$folds
+      if (!is.null(folds_tbl) && is.data.frame(folds_tbl) && nrow(folds_tbl) > 0) {
+        # Always recompute aggregated from folds to ensure proper CV statistics
+        # (mean and SD across folds) instead of pooled metrics
+        agg <- fastml_aggregate_resample_metrics(folds_tbl, task)
+        if (!is.null(agg) && is.data.frame(agg) && nrow(agg) > 0) {
+          entry$aggregated <- agg
+        }
+      }
+      entry
+    })
+  }
+
   if (!is.null(nested_results)) {
     nested_named <- list()
     for (alg in names(nested_results)) {
@@ -1196,10 +1422,18 @@ fastml <- function(data = NULL,
   }
 
 
-  # Now apply the function over the flattened list
-  lower_is_better_metrics <- c("rmse", "mae", "ibs", "logloss", "mse", "brier_score")
+  selection_bundle <- fastml_extract_selection_performance(
+    resampling_results = resampling_results,
+    nested_results = nested_results,
+    task = task
+  )
+  selection_performance <- selection_bundle$performance
+  selection_source <- if (is.null(selection_bundle$source)) "none" else selection_bundle$source
+
+  # Select best model strictly from resampling metrics (CV or nested CV).
+  lower_is_better_metrics <- c("rmse", "mae", "ibs", "logloss", "mse", "brier_score", "ece")
   extract_metric_values <- function(metric_name) {
-    sapply(combined_performance, function(x) {
+    sapply(selection_performance, function(x) {
       if (is.data.frame(x)) {
         vals <- x[x$.metric == metric_name, ".estimate", drop = TRUE]
         if (length(vals) == 0) {
@@ -1235,65 +1469,79 @@ fastml <- function(data = NULL,
     }
   }
 
-  metric_values <- extract_metric_values(metric)
-  lower_is_better <- compute_lower_is_better(metric)
-
-  if (!any(is.finite(metric_values))) {
-    available_metrics <- unique(unlist(lapply(combined_performance, function(x) {
-      if (is.data.frame(x)) {
-        as.character(x$.metric)
-      } else {
-        character(0)
-      }
-    })))
-
-    fallback_priority <- if (task == "classification") {
-      c("roc_auc", "accuracy", "kap", "sens", "spec", "precision", "f_meas")
-    } else if (task == "regression") {
-      c("rmse", "mae", "rsq")
-    } else {
-      c("c_index", "uno_c", "ibs", "rmst_diff")
+  if (length(selection_performance) == 0) {
+    if (length(models) > 1) {
+      warning(
+        paste(
+          "No resampling metrics are available for model selection.",
+          "Holdout evaluation is reserved for final performance estimation.",
+          "Defaulting to the first trained model."
+        ),
+        call. = FALSE
+      )
     }
-
-    candidate_metrics <- setdiff(fallback_priority, metric)
-    candidate_metrics <- candidate_metrics[candidate_metrics %in% available_metrics]
-    remaining_metrics <- setdiff(available_metrics, c(metric, candidate_metrics))
-    candidate_metrics <- c(candidate_metrics, remaining_metrics)
-
-    fallback_metric <- NULL
-    for (cand in candidate_metrics) {
-      cand_values <- extract_metric_values(cand)
-      if (any(is.finite(cand_values))) {
-        fallback_metric <- cand
-        metric_values <- cand_values
-        lower_is_better <- compute_lower_is_better(cand)
-        break
-      }
-    }
-
-    if (!is.null(fallback_metric)) {
-      warning(sprintf("Metric '%s' unavailable across models; falling back to '%s'.", metric, fallback_metric), call. = FALSE)
-      metric <- fallback_metric
-    }
-  }
-
-  if (!any(is.finite(metric_values))) {
-    stop("None of the models returned the specified metric.")
-  }
-
-  if (any(is.na(metric_values))) {
-    warning("Some models did not return the specified metric.")
-    metric_values[is.na(metric_values)] <- if (lower_is_better) Inf else -Inf
-  }
-
-  if (all(metric_values == if (lower_is_better) Inf else -Inf)) {
-    stop("None of the models returned the specified metric.")
-  }
-
-  best_model_idx <- if (lower_is_better) {
-    names(metric_values[metric_values == min(metric_values)])
+    best_model_idx <- names(models)[1]
   } else {
-    names(metric_values[metric_values == max(metric_values)])
+    metric_values <- extract_metric_values(metric)
+    lower_is_better <- compute_lower_is_better(metric)
+
+    if (!any(is.finite(metric_values))) {
+      available_metrics <- unique(unlist(lapply(selection_performance, function(x) {
+        if (is.data.frame(x)) {
+          as.character(x$.metric)
+        } else {
+          character(0)
+        }
+      })))
+
+      fallback_priority <- if (task == "classification") {
+        c("logloss", "brier_score", "ece", "roc_auc", "accuracy", "kap", "sens", "spec", "precision", "f_meas")
+      } else if (task == "regression") {
+        c("rmse", "mae", "rsq")
+      } else {
+        c("c_index", "uno_c", "ibs", "rmst_diff")
+      }
+
+      candidate_metrics <- setdiff(fallback_priority, metric)
+      candidate_metrics <- candidate_metrics[candidate_metrics %in% available_metrics]
+      remaining_metrics <- setdiff(available_metrics, c(metric, candidate_metrics))
+      candidate_metrics <- c(candidate_metrics, remaining_metrics)
+
+      fallback_metric <- NULL
+      for (cand in candidate_metrics) {
+        cand_values <- extract_metric_values(cand)
+        if (any(is.finite(cand_values))) {
+          fallback_metric <- cand
+          metric_values <- cand_values
+          lower_is_better <- compute_lower_is_better(cand)
+          break
+        }
+      }
+
+      if (!is.null(fallback_metric)) {
+        warning(sprintf("Metric '%s' unavailable across models; falling back to '%s'.", metric, fallback_metric), call. = FALSE)
+        metric <- fallback_metric
+      }
+    }
+
+    if (!any(is.finite(metric_values))) {
+      stop("None of the models returned the specified metric from resampling.")
+    }
+
+    if (any(is.na(metric_values))) {
+      warning("Some models did not return the specified metric from resampling.")
+      metric_values[is.na(metric_values)] <- if (lower_is_better) Inf else -Inf
+    }
+
+    if (all(metric_values == if (lower_is_better) Inf else -Inf)) {
+      stop("None of the models returned the specified metric from resampling.")
+    }
+
+    best_model_idx <- if (lower_is_better) {
+      names(metric_values[metric_values == min(metric_values)])
+    } else {
+      names(metric_values[metric_values == max(metric_values)])
+    }
   }
 
   # model_names <- get_model_engine_names(models)
@@ -1313,7 +1561,11 @@ fastml <- function(data = NULL,
 
   if (verbose) {
     msg <- paste0(names(best_model_name), " (", best_model_name, ")", collapse = ", ")
-    message("Best model selected: ", msg)
+    if (selection_source == "none") {
+      message("Best model defaulted to first trained model (no resampling metrics available).")
+    } else {
+      message("Best model selected using ", selection_source, " metrics: ", msg)
+    }
   }
 
 
@@ -1344,66 +1596,165 @@ fastml <- function(data = NULL,
         rsample::training(sub_split)
       }
 
+      n_sub <- nrow(sub_train)
+      if (is.null(n_sub) || n_sub < 2) {
+        return(data.frame(Fraction = fraction, Performance = NA_real_))
+      }
+
+      adjust_folds <- function(n_rows, folds_val) {
+        if (is.null(folds_val)) {
+          return(NULL)
+        }
+        folds_int <- suppressWarnings(as.integer(folds_val))
+        if (!is.finite(folds_int)) {
+          return(folds_val)
+        }
+        n_rows <- suppressWarnings(as.integer(n_rows))
+        if (!is.finite(n_rows) || n_rows <= 2L) {
+          return(NA_integer_)
+        }
+        max_allowed <- max(2L, n_rows - 1L)
+        max(2L, min(folds_int, max_allowed))
+      }
+
+      sub_resampling_method <- resampling_method
+      sub_folds <- folds
+      sub_outer_folds <- outer_folds
+      folds_adjusted <- FALSE
+      outer_adjusted <- FALSE
+      resampling_disabled <- FALSE
+      if (!is.null(resampling_method)) {
+        if (resampling_method %in% c("cv", "repeatedcv", "grouped_cv", "nested_cv")) {
+          sub_folds <- adjust_folds(n_sub, folds)
+          folds_adjusted <- !is.null(folds) && !is.na(sub_folds) &&
+            !identical(as.integer(folds), as.integer(sub_folds))
+        }
+        if (resampling_method == "nested_cv") {
+          sub_outer_folds <- adjust_folds(n_sub, outer_folds)
+          outer_adjusted <- !is.null(outer_folds) && !is.na(sub_outer_folds) &&
+            !identical(as.integer(outer_folds), as.integer(sub_outer_folds))
+        }
+      }
+      if (resampling_method %in% c("cv", "repeatedcv", "grouped_cv") &&
+          is.na(sub_folds)) {
+        sub_resampling_method <- "none"
+        sub_folds <- folds
+        resampling_disabled <- TRUE
+      }
+      if (resampling_method == "nested_cv" &&
+          (is.na(sub_folds) || is.na(sub_outer_folds))) {
+        sub_resampling_method <- "none"
+        sub_folds <- folds
+        sub_outer_folds <- outer_folds
+        resampling_disabled <- TRUE
+      }
+      if (resampling_disabled) {
+        warning(
+          sprintf(
+            "Learning curve: disabling resampling for %.0f%% subset (n=%d) to avoid invalid CV settings.",
+            fraction * 100, n_sub
+          ),
+          call. = FALSE
+        )
+      } else {
+        if (folds_adjusted) {
+          warning(
+            sprintf(
+              "Learning curve: reducing folds from %d to %d for %.0f%% subset (n=%d).",
+              as.integer(folds), as.integer(sub_folds), fraction * 100, n_sub
+            ),
+            call. = FALSE
+          )
+        }
+        if (outer_adjusted) {
+          warning(
+            sprintf(
+              "Learning curve: reducing outer_folds from %d to %d for %.0f%% subset (n=%d).",
+              as.integer(outer_folds), as.integer(sub_outer_folds), fraction * 100, n_sub
+            ),
+            call. = FALSE
+          )
+        }
+      }
+
       # Train models on the subset
-      sub_models <- train_models(
-        train_data = sub_train,
-        label = label,
-        task = task,
-        algorithms = algorithms,
-        resampling_method = resampling_method,
-        folds = folds,
-        repeats = repeats,
-        group_cols = group_cols,
-        block_col = block_col,
-        block_size = block_size,
-        initial_window = initial_window,
-        assess_window = assess_window,
-        skip = skip,
-        outer_folds = outer_folds,
-        resamples = resamples,
-        tune_params = tune_params,
-        engine_params = engine_params,
-        metric = metric,
-        summaryFunction = summaryFunction,
-        seed = seed,
-        recipe = recipe,
-        use_default_tuning = use_default_tuning,
-        tuning_strategy = tuning_strategy,
-        tuning_iterations = tuning_iterations,
-        early_stopping = early_stopping,
-        adaptive = adaptive,
-        algorithm_engines = algorithm_engines,
-        event_class = event_class,
-        start_col = start_col,
-        time_col = time_col,
-        status_col = status_col,
-        eval_times = eval_times,
-        at_risk_threshold = at_risk_threshold,
-        audit_env = audit_env
+      sub_models <- withCallingHandlers(
+        train_models(
+          train_data = sub_train,
+          label = label,
+          task = task,
+          algorithms = algorithms,
+          resampling_method = sub_resampling_method,
+          folds = sub_folds,
+          repeats = repeats,
+          group_cols = group_cols,
+          block_col = block_col,
+          block_size = block_size,
+          initial_window = initial_window,
+          assess_window = assess_window,
+          skip = skip,
+          outer_folds = sub_outer_folds,
+          resamples = resamples,
+          tune_params = tune_params,
+          engine_params = engine_params,
+          metric = metric,
+          summaryFunction = summaryFunction,
+          seed = seed,
+          recipe = recipe,
+          use_default_tuning = use_default_tuning,
+          tuning_strategy = tuning_strategy,
+          tuning_iterations = tuning_iterations,
+          tuning_complexity = tuning_complexity,
+          grid_levels = grid_levels,
+          early_stopping = early_stopping,
+          adaptive = adaptive,
+          algorithm_engines = algorithm_engines,
+          use_parsnip_defaults = use_parsnip_defaults,
+          warn_engine_defaults = warn_engine_defaults,
+          n_cores = n_cores,
+          verbose = verbose,
+          event_class = event_class,
+          start_col = start_col,
+          time_col = time_col,
+          status_col = status_col,
+          eval_times = eval_times,
+          at_risk_threshold = at_risk_threshold,
+          survival_metric_convention = survival_metric_convention,
+          audit_env = audit_env,
+          multiclass_auc = multiclass_auc
+        ),
+        warning = fastml_muffle_foreach_warning
       )
 
 
 
       # Evaluate models on the subset
       sub_eval <- evaluate_models(
-        sub_models,
-        sub_train,
-        test_data,
-        label_surv,
-        task,
-        metric,
-        event_class,
+        models = sub_models,
+        train_data = sub_train,
+        test_data = test_data,
+        label = label_surv,
+        start_col = start_col,
+        time_col = time_col,
+        status_col = status_col,
+        task = task,
+        metric = metric,
+        event_class = event_class,
+        class_threshold = class_threshold,
         eval_times = eval_times,
         bootstrap_ci = bootstrap_ci,
         bootstrap_samples = bootstrap_samples,
         bootstrap_seed = bootstrap_seed,
-        at_risk_threshold = at_risk_threshold
+        at_risk_threshold = at_risk_threshold,
+        survival_metric_convention = survival_metric_convention,
+        multiclass_auc = multiclass_auc
       )
 
 
       # Extract the performance metric from each model evaluation
-      perf_values <- sapply(sub_eval$performance, function(engine_list) {
-        perf_df <- engine_list[[1]]
+      perf_values <- sapply(sub_eval$performance, function(entry) {
+        # entry may be a data frame (unwrapped single-engine) or a list of data frames
+        perf_df <- if (inherits(entry, "data.frame")) entry else entry[[1]]
         val <- perf_df[perf_df$.metric == metric, ".estimate", drop = TRUE]
         if (length(val) == 0) NA_real_ else as.numeric(val[[1]])
       })
@@ -1464,6 +1815,9 @@ fastml <- function(data = NULL,
     task = task,
     models = models,
     metric = metric,
+    class_threshold = class_threshold,
+    multiclass_auc = multiclass_auc,
+    selection = list(source = selection_source, metric = metric),
     positive_class = positive_class,
     event_class = event_class,
     engine_names = engine_names,
@@ -1473,6 +1827,7 @@ fastml <- function(data = NULL,
     ),
     survival_brier_times = survival_brier_times,
     survival_t_max = survival_t_max,
+    survival_metric_convention = survival_metric_convention,
     metric_bootstrap = list(enabled = bootstrap_ci, samples = bootstrap_samples, seed = bootstrap_seed),
     resampling_results = resampling_results,
     resampling_plan = resampling_plan,

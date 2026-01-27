@@ -13,6 +13,14 @@
 #' @param label The name of the outcome variable (as a character string).
 #' @param event_class For binary classification, specifies which class is considered the positive class:
 #'   `"first"` or `"second"`.
+#' @param class_threshold For binary classification, controls how class probabilities
+#'   are converted into hard class predictions. Numeric values in (0, 1) set a
+#'   fixed threshold. The default `"auto"` tunes a threshold on the training data
+#'   to maximize F1; use `"model"` to keep the model's default threshold.
+#' @param multiclass_auc For multiclass ROC AUC, the averaging method to use:
+#'   `"macro"` (default, tidymodels) or `"macro_weighted"`. Macro weights each
+#'   class equally, while macro_weighted weights by class prevalence and can
+#'   change model rankings on imbalanced data.
 #' @param start_col Optional string. The name of the column specifying the
 #'   start time in counting process (e.g., `(start, stop, event)`) survival
 #'   data. Only used when \code{task = "survival"}.
@@ -41,6 +49,12 @@
 #' @param at_risk_threshold Numeric value between 0 and 1 defining the minimum
 #'   proportion of subjects required to remain at risk when determining the
 #'   maximum follow-up time used in survival metrics.
+#' @param survival_metric_convention Character string specifying which survival
+#'   metric conventions to follow. `"fastml"` (default) uses fastml's internal
+#'   defaults for evaluation horizons and t_max. `"tidymodels"` uses
+#'   `eval_times_user` as the explicit evaluation grid and applies
+#'   yardstick-style Brier/IBS normalization; when `eval_times_user` is `NULL`,
+#'   time-dependent Brier metrics are omitted.
 #' @param precomputed_predictions Optional data frame or nested list of
 #'   previously generated predictions (per algorithm/engine) to reuse instead
 #'   of re-predicting; primarily used when combining results across engines.
@@ -58,6 +72,8 @@
 #' - For classification tasks, performance metrics include accuracy, kappa, sensitivity, specificity, precision,
 #'   F1-score, and ROC AUC (if probabilities are available).
 #'
+#' - For multiclass ROC AUC, the estimator is controlled by `multiclass_auc`.
+#'
 #' - For regression tasks, RMSE, R-squared, and MAE are returned.
 #' 
 #' - For models with missing prediction lengths, a helpful imputation error is thrown to guide data preprocessing.
@@ -72,6 +88,7 @@ process_model <- function(model_obj,
                           test_data,
                           label,
                           event_class,
+                          class_threshold = "auto",
                           start_col = NULL,
                           time_col = NULL,
                           status_col = NULL,
@@ -83,24 +100,63 @@ process_model <- function(model_obj,
                           bootstrap_samples = 500,
                           bootstrap_seed = 1234,
                           at_risk_threshold = 0.1,
+                          survival_metric_convention = "fastml",
                           metrics = NULL,
                           summaryFunction = NULL,
-                          precomputed_predictions = NULL) {
+                          precomputed_predictions = NULL,
+                          multiclass_auc = "macro") {
   # If the model object is a tuning result, finalize the workflow
   if (inherits(model_obj, "tune_results")) {
-    best_params <- tryCatch({
-      tune::select_best(model_obj, metric = metric)
-    }, error = function(e) {
+    select_metric <- metric
+    select_best_safe <- function(metric_name) {
+      tryCatch(tune::select_best(model_obj, metric = metric_name),
+               error = function(e) e)
+    }
+    best_params <- select_best_safe(select_metric)
+    select_error <- NULL
+    if (inherits(best_params, "error")) {
+      select_error <- best_params
+      available_metrics <- tryCatch(
+        unique(tune::collect_metrics(model_obj)$.metric),
+        error = function(e) NULL
+      )
+      if (!is.null(available_metrics) && length(available_metrics) > 0) {
+        fallback_priority <- switch(task,
+          classification = c("logloss", "brier_score", "roc_auc", "accuracy", "kap",
+                             "sens", "spec", "precision", "f_meas"),
+          regression = c("rmse", "rsq", "mae"),
+          survival = c("c_index", "uno_c", "ibs", "rmst_diff"),
+          c()
+        )
+        candidate_metrics <- c(
+          fallback_priority[fallback_priority %in% available_metrics],
+          setdiff(available_metrics, fallback_priority)
+        )
+        candidate_metrics <- unique(setdiff(candidate_metrics, select_metric))
+        for (cand in candidate_metrics) {
+          res <- select_best_safe(cand)
+          if (!inherits(res, "error")) {
+            best_params <- res
+            warning(sprintf(
+              "Metric '%s' unavailable for model '%s'; selecting best by '%s'.",
+              select_metric,
+              model_id,
+              cand
+            ), call. = FALSE)
+            break
+          }
+        }
+      }
+    }
+    if (inherits(best_params, "error") || is.null(best_params)) {
       warning(paste(
         "Could not select best parameters for model",
         model_id,
         ":",
-        e$message
+        conditionMessage(select_error)
       ))
       return(NULL)
-    })
-    if (is.null(best_params))
-      return(NULL)
+    }
 
     model_spec <- workflows::pull_workflow_spec(model_obj)
     model_recipe <- workflows::pull_workflow_preprocessor(model_obj)
@@ -186,13 +242,32 @@ process_model <- function(model_obj,
   if (task == "classification") {
     pred_class <- predict(final_model, new_data = test_data, type = "class")$.pred_class
 
-
+    pred_prob <- NULL
+    pred_prob_error <- NULL
     if (!is.null(engine) &&
         !is.na(engine) && engine != "LiblineaR") {
-      pred_prob <- predict(final_model, new_data = test_data, type = "prob")
+      pred_prob <- tryCatch(
+        predict(final_model, new_data = test_data, type = "prob"),
+        error = function(e) {
+          pred_prob_error <<- e
+          NULL
+        }
+      )
+      if (!is.null(pred_prob) && !is.data.frame(pred_prob)) {
+        pred_prob <- NULL
+      }
+      if (is.null(pred_prob) && !is.null(pred_prob_error)) {
+        warning(
+          sprintf(
+            "Probability predictions failed for model '%s' (engine: %s); ROC AUC will be skipped. %s",
+            model_id,
+            engine,
+            conditionMessage(pred_prob_error)
+          ),
+          call. = FALSE
+        )
+      }
     }
-
-
 
     if (nrow(test_data) != length(pred_class)) {
       stop(
@@ -203,29 +278,216 @@ process_model <- function(model_obj,
 
     data_metrics <- test_data %>%
       dplyr::select(truth = !!rlang::sym(label)) %>%
-      dplyr::mutate(estimate = pred_class) %>%
-      {
-        if (!is.null(engine) && !is.na(engine) && engine != "LiblineaR") {
-          dplyr::bind_cols(., pred_prob)
-        } else {
-          .
-        }
-      }
+      dplyr::mutate(estimate = pred_class)
 
-    if (all(grepl("^\\.pred_p", names(data_metrics)[3:4]))) {
-      pred_name = ".pred_p"
-    } else{
-      pred_name = ".pred_"
+    prob_available <- !is.null(pred_prob) && is.data.frame(pred_prob) && ncol(pred_prob) > 0
+    if (prob_available) {
+      data_metrics <- dplyr::bind_cols(data_metrics, pred_prob)
     }
 
-    prob_cols <- setdiff(names(data_metrics), c("truth", "estimate"))
+    prob_cols_all <- setdiff(names(data_metrics), c("truth", "estimate"))
+    prob_cols <- prob_cols_all
+    if (length(prob_cols_all) > 0) {
+      prob_cols <- prob_cols_all[
+        vapply(data_metrics[prob_cols_all], is.numeric, logical(1))
+      ]
+    }
+    prob_available <- prob_available && length(prob_cols) > 0
     has_probabilities <- !is.null(engine) &&
       !is.na(engine) && engine != "LiblineaR" &&
       length(prob_cols) > 0
 
-    num_classes <- length(unique(data_metrics$truth))
+    compute_calibration_rows <- function(df) {
+      if (!prob_available || length(prob_cols) == 0) {
+        return(NULL)
+      }
+      prob_info <- fastml_prepare_prob_matrix(df, prob_cols)
+      if (is.null(prob_info)) {
+        return(NULL)
+      }
+      calib <- fastml_class_calibration_metrics(
+        truth_vec = df$truth,
+        prob_mat = prob_info$mat,
+        prob_cols = prob_info$cols,
+        event_class = event_class
+      )
+      if (!is.finite(calib$logloss) &&
+          !is.finite(calib$brier_score) &&
+          !is.finite(calib$ece)) {
+        return(NULL)
+      }
+      tibble::tibble(
+        .metric = c("logloss", "brier_score", "ece"),
+        .estimator = rep(calib$estimator, 3),
+        .estimate = as.numeric(c(calib$logloss, calib$brier_score, calib$ece))
+      )
+    }
+
+    ensure_calibration_metrics <- function(perf_df, estimator_value) {
+      metric_names <- c("logloss", "brier_score", "ece")
+      missing <- setdiff(metric_names, perf_df$.metric)
+      if (length(missing) == 0) {
+        return(perf_df)
+      }
+      add_rows <- tibble::tibble(
+        .metric = missing,
+        .estimator = rep(estimator_value, length(missing)),
+        .estimate = NA_real_
+      )
+      dplyr::bind_rows(perf_df, add_rows)
+    }
+
+    resolve_class_threshold <- function(class_threshold, metric_name) {
+      if (is.null(class_threshold)) {
+        return(list(mode = "model", metric = NULL, value = NA_real_))
+      }
+      if (is.numeric(class_threshold)) {
+        if (length(class_threshold) != 1 || !is.finite(class_threshold)) {
+          return(list(mode = "model", metric = NULL, value = NA_real_))
+        }
+        return(list(
+          mode = "fixed",
+          metric = "fixed",
+          value = min(max(class_threshold, 0), 1)
+        ))
+      }
+      if (!is.character(class_threshold) || length(class_threshold) != 1 || !nzchar(class_threshold)) {
+        return(list(mode = "model", metric = NULL, value = NA_real_))
+      }
+      method <- tolower(class_threshold)
+      if (method %in% c("f1", "f1_score", "f1-score")) {
+        method <- "f_meas"
+      }
+      if (method %in% c("model", "none", "default")) {
+        return(list(mode = "model", metric = NULL, value = NA_real_))
+      }
+      if (method == "auto") {
+        threshold_metrics <- c("accuracy", "sens", "spec", "precision", "f_meas")
+        if (!is.null(metric_name) && metric_name %in% threshold_metrics) {
+          method <- metric_name
+        } else {
+          method <- "f_meas"
+        }
+      }
+      if (method %in% c("accuracy", "sens", "spec", "precision", "f_meas", "youden")) {
+        return(list(mode = "tuned", metric = method, value = NA_real_))
+      }
+      warning(
+        sprintf("Unsupported class_threshold '%s'; using model default predictions.", class_threshold),
+        call. = FALSE
+      )
+      list(mode = "model", metric = NULL, value = NA_real_)
+    }
+
+    compute_optimal_threshold <- function(truth_vec, prob_vec, positive_class, method) {
+      if (is.null(positive_class)) {
+        return(NA_real_)
+      }
+      valid <- is.finite(prob_vec) & !is.na(truth_vec)
+      if (!any(valid)) {
+        return(NA_real_)
+      }
+      truth_vec <- as.character(truth_vec[valid])
+      prob_vec <- prob_vec[valid]
+      if (length(unique(truth_vec)) < 2) {
+        return(NA_real_)
+      }
+      pos <- truth_vec == positive_class
+      n_pos <- sum(pos)
+      n_neg <- length(pos) - n_pos
+      if (n_pos == 0 || n_neg == 0) {
+        return(NA_real_)
+      }
+      ord <- order(prob_vec, decreasing = TRUE)
+      prob_sorted <- prob_vec[ord]
+      pos_sorted <- pos[ord]
+      rle_probs <- rle(prob_sorted)
+      idx_end <- cumsum(rle_probs$lengths)
+      tp <- cumsum(pos_sorted)[idx_end]
+      fp <- cumsum(!pos_sorted)[idx_end]
+      fn <- n_pos - tp
+      tn <- n_neg - fp
+
+      accuracy <- (tp + tn) / (n_pos + n_neg)
+      sens <- ifelse((tp + fn) > 0, tp / (tp + fn), NA_real_)
+      spec <- ifelse((tn + fp) > 0, tn / (tn + fp), NA_real_)
+      precision <- ifelse((tp + fp) > 0, tp / (tp + fp), NA_real_)
+      f_meas <- ifelse((precision + sens) > 0, 2 * precision * sens / (precision + sens), NA_real_)
+      youden <- sens + spec - 1
+
+      metric_vals <- switch(
+        method,
+        accuracy = accuracy,
+        sens = sens,
+        spec = spec,
+        precision = precision,
+        f_meas = f_meas,
+        youden = youden,
+        accuracy
+      )
+      if (!any(is.finite(metric_vals))) {
+        return(NA_real_)
+      }
+      best_val <- max(metric_vals, na.rm = TRUE)
+      best_idx <- which(metric_vals == best_val)
+      if (length(best_idx) > 1) {
+        best_idx <- best_idx[which.min(abs(rle_probs$values[best_idx] - 0.5))]
+      }
+      rle_probs$values[best_idx]
+    }
+
+    tune_class_threshold <- function(positive_class, method) {
+      if (is.null(train_data) || !is.data.frame(train_data)) {
+        return(NA_real_)
+      }
+      train_truth <- train_data[[label]]
+      if (is.null(train_truth)) {
+        return(NA_real_)
+      }
+      train_prob <- tryCatch(
+        predict(final_model, new_data = train_data, type = "prob"),
+        error = function(e) NULL
+      )
+      if (is.null(train_prob) || !is.data.frame(train_prob) || nrow(train_prob) == 0) {
+        return(NA_real_)
+      }
+      prob_cols_train <- names(train_prob)
+      prob_cols_train <- prob_cols_train[
+        vapply(train_prob[prob_cols_train], is.numeric, logical(1))
+      ]
+      if (length(prob_cols_train) == 0) {
+        return(NA_real_)
+      }
+      prob_meta_train <- fastml_resolve_binary_prob_column(
+        prob_cols = prob_cols_train,
+        truth_levels = truth_levels,
+        event_class = event_class
+      )
+      prob_col_train <- prob_meta_train$prob_col
+      if (is.null(prob_col_train) || !is.numeric(train_prob[[prob_col_train]])) {
+        return(NA_real_)
+      }
+      if (!any(is.finite(train_prob[[prob_col_train]]))) {
+        return(NA_real_)
+      }
+      train_truth <- factor(train_truth, levels = truth_levels)
+      compute_optimal_threshold(
+        truth_vec = train_truth,
+        prob_vec = train_prob[[prob_col_train]],
+        positive_class = positive_class,
+        method = method
+      )
+    }
+
+    truth_levels <- levels(data_metrics$truth)
+    if (is.null(truth_levels) || length(truth_levels) == 0) {
+      truth_levels <- unique(as.character(data_metrics$truth))
+    }
+    num_classes <- length(truth_levels)
+    observed_classes <- length(unique(data_metrics$truth))
 
     metric_name <- metric
+    multiclass_auc <- fastml_normalize_multiclass_auc(multiclass_auc)
     build_class_metrics <- function() {
       if (is.null(summaryFunction)) {
         return(yardstick::metric_set(
@@ -264,14 +526,59 @@ process_model <- function(model_obj,
       )
     }
 
+    threshold_used <- NA_real_
+    threshold_metric <- NA_character_
+
     if (num_classes == 2) {
-      # Determine the positive class based on event_class parameter
-      if (event_class == "first") {
-        positive_class <- levels(data_metrics$truth)[1]
-      } else if (event_class == "second") {
-        positive_class <- levels(data_metrics$truth)[2]
-      } else {
+      if (!event_class %in% c("first", "second")) {
         stop("Invalid event_class argument. It should be either 'first' or 'second'.")
+      }
+
+      prob_meta <- fastml_resolve_binary_prob_column(
+        prob_cols = prob_cols,
+        truth_levels = truth_levels,
+        event_class = event_class
+      )
+      prob_col <- prob_meta$prob_col
+      positive_class <- prob_meta$positive_class
+
+      if (!is.null(prob_col) && !is.numeric(data_metrics[[prob_col]])) {
+        prob_col <- NULL
+      }
+      if (!is.null(prob_col) && !any(is.finite(data_metrics[[prob_col]]))) {
+        prob_col <- NULL
+      }
+      if (prob_available && !is.null(prob_col) && isTRUE(prob_meta$used_fallback)) {
+        warning(
+          sprintf(
+            "Probability column for positive class '%s' not found; using '%s' based on column order.",
+            positive_class,
+            prob_col
+          ),
+          call. = FALSE
+        )
+      }
+
+      if (prob_available && !is.null(prob_col)) {
+        threshold_spec <- resolve_class_threshold(class_threshold, metric_name)
+        if (identical(threshold_spec$mode, "fixed")) {
+          threshold_used <- threshold_spec$value
+          threshold_metric <- threshold_spec$metric
+        } else if (identical(threshold_spec$mode, "tuned")) {
+          threshold_metric <- threshold_spec$metric
+          threshold_used <- tune_class_threshold(positive_class, threshold_spec$metric)
+        }
+        if (is.finite(threshold_used) && !is.null(positive_class)) {
+          negative_class <- setdiff(truth_levels, positive_class)[1]
+          if (!is.null(negative_class) && length(negative_class) == 1 && !is.na(negative_class)) {
+            data_metrics$estimate <- ifelse(
+              data_metrics[[prob_col]] >= threshold_used,
+              positive_class,
+              negative_class
+            )
+            data_metrics$estimate <- factor(data_metrics$estimate, levels = truth_levels)
+          }
+        }
       }
 
       metrics_class <- build_class_metrics()
@@ -282,17 +589,56 @@ process_model <- function(model_obj,
         event_level = event_class
       )
 
-      if (has_probabilities) {
-        # Compute ROC AUC using the probability column for the positive class
-        roc_auc_value <- yardstick::roc_auc(
-          data_metrics,
-          truth = truth,!!rlang::sym(paste0(pred_name, positive_class)),
-          event_level = event_class
-        )
-        perf <- dplyr::bind_rows(perf_class, roc_auc_value)
-      } else{
+      if (prob_available) {
+        if (observed_classes < 2) {
+          warning(
+            sprintf(
+              "Only one class present in truth for model '%s'; ROC AUC will be skipped.",
+              model_id
+            ),
+            call. = FALSE
+          )
+          perf <- perf_class
+        } else if (!is.null(prob_col)) {
+          # Compute ROC AUC using the probability column for the positive class
+          roc_auc_value <- yardstick::roc_auc(
+            data_metrics,
+            truth = truth,!!rlang::sym(prob_col),
+            event_level = event_class
+          )
+          perf <- dplyr::bind_rows(perf_class, roc_auc_value)
+        } else {
+          warning(
+            sprintf(
+              "Probability column for positive class '%s' not found for model '%s'; ROC AUC will be skipped. Available columns: %s",
+              ifelse(is.null(positive_class), "", positive_class),
+              model_id,
+              paste(prob_cols, collapse = ", ")
+            ),
+            call. = FALSE
+          )
+          perf <- perf_class
+        }
+      } else {
         perf <- perf_class
       }
+
+      if (!any(perf$.metric == "roc_auc")) {
+        perf <- dplyr::bind_rows(
+          perf,
+          tibble::tibble(
+            .metric = "roc_auc",
+            .estimator = "binary",
+            .estimate = NA_real_
+          )
+        )
+      }
+
+      calib_rows <- compute_calibration_rows(data_metrics)
+      if (!is.null(calib_rows)) {
+        perf <- dplyr::bind_rows(perf, calib_rows)
+      }
+      perf <- ensure_calibration_metrics(perf, NA_character_)
 
       compute_boot_perf <- function(df) {
         perf_boot <- tryCatch(
@@ -307,11 +653,11 @@ process_model <- function(model_obj,
         if (is.null(perf_boot)) {
           perf_boot <- perf[0, , drop = FALSE]
         }
-        if (has_probabilities) {
+        if (prob_available && !is.null(prob_col) && prob_col %in% names(df)) {
           roc_boot <- tryCatch(
             suppressWarnings(yardstick::roc_auc(
               df,
-              truth = truth,!!rlang::sym(paste0(pred_name, positive_class)),
+              truth = truth,!!rlang::sym(prob_col),
               event_level = event_class
             )),
             error = function(e) NULL
@@ -320,28 +666,55 @@ process_model <- function(model_obj,
             perf_boot <- dplyr::bind_rows(perf_boot, roc_boot)
           }
         }
+        calib_boot <- compute_calibration_rows(df)
+        if (!is.null(calib_boot)) {
+          perf_boot <- dplyr::bind_rows(perf_boot, calib_boot)
+        }
         perf_boot
       }
     } else {
-      # Multiclass classification (using macro averaging)
+      # Multiclass classification (macro metrics; ROC AUC uses configured estimator)
       metrics_class <- build_class_metrics()
       perf_class <- safe_metrics_class(
         data_metrics,
         truth = truth,
         estimate = estimate,
-        estimator = "macro"
+        estimator = multiclass_auc
       )
 
       if (has_probabilities) {
         perf_roc_auc <- yardstick::roc_auc(
           data_metrics,
           truth = truth,!!!rlang::syms(prob_cols),
-          estimator = "macro_weighted"
+          estimator = multiclass_auc
         )
         perf <- dplyr::bind_rows(perf_class, perf_roc_auc)
       } else {
         perf <- perf_class
       }
+
+      if (!any(perf$.metric == "roc_auc")) {
+        perf <- dplyr::bind_rows(
+          perf,
+          tibble::tibble(
+            .metric = "roc_auc",
+            .estimator = multiclass_auc,
+            .estimate = NA_real_
+          )
+        )
+      }
+
+      calib_rows <- compute_calibration_rows(data_metrics)
+      if (!is.null(calib_rows)) {
+        perf <- dplyr::bind_rows(perf, calib_rows)
+      }
+      calib_estimator <- if (!is.null(calib_rows) &&
+                             ".estimator" %in% names(calib_rows)) {
+        calib_rows$.estimator[1]
+      } else {
+        "macro"
+      }
+      perf <- ensure_calibration_metrics(perf, calib_estimator)
 
       compute_boot_perf <- function(df) {
         perf_boot <- tryCatch(
@@ -349,7 +722,7 @@ process_model <- function(model_obj,
             df,
             truth = truth,
             estimate = estimate,
-            estimator = "macro"
+            estimator = multiclass_auc
           )),
           error = function(e) NULL
         )
@@ -361,7 +734,7 @@ process_model <- function(model_obj,
             suppressWarnings(yardstick::roc_auc(
               df,
               truth = truth,!!!rlang::syms(prob_cols),
-              estimator = "macro_weighted"
+              estimator = multiclass_auc
             )),
             error = function(e) NULL
           )
@@ -369,12 +742,23 @@ process_model <- function(model_obj,
             perf_boot <- dplyr::bind_rows(perf_boot, roc_boot)
           }
         }
+        calib_boot <- compute_calibration_rows(df)
+        if (!is.null(calib_boot)) {
+          perf_boot <- dplyr::bind_rows(perf_boot, calib_boot)
+        }
         perf_boot
       }
     }
 
     perf <- add_bootstrap_ci(perf, data_metrics, compute_boot_perf)
+    if (is.finite(threshold_used)) {
+      attr(perf, "class_threshold") <- threshold_used
+      attr(perf, "class_threshold_metric") <- threshold_metric
+      attr(data_metrics, "class_threshold") <- threshold_used
+      attr(data_metrics, "class_threshold_metric") <- threshold_metric
+    }
   } else if (task == "survival") {
+    survival_metric_convention <- fastml_normalize_survival_convention(survival_metric_convention)
     status_warning_emitted <- FALSE
     normalize_status <- function(status_vec, reference_length) {
       res <- fastml_normalize_survival_status(status_vec, reference_length)
@@ -884,85 +1268,122 @@ process_model <- function(model_obj,
 
     t0 <- stats::median(train_times, na.rm = TRUE)
     threshold <- min(max(at_risk_threshold, 0.01), 0.5)
-    tau_max <- compute_tau_limit(obs_time, threshold)
-    if (!is.finite(tau_max) || tau_max <= 0) {
-      tau_max <- suppressWarnings(max(obs_time[is.finite(obs_time)], na.rm = TRUE))
-    }
-    if (!is.finite(tau_max) || tau_max <= 0) {
-      tau_max <- NA_real_
-    }
 
-    digits_round <- determine_round_digits(obs_time)
-    if (is.null(eval_times_user)) {
-      eval_horizons <- unique(round(c(
-        stats::median(obs_time, na.rm = TRUE),
-        as.numeric(
-          stats::quantile(obs_time, 0.75, na.rm = TRUE, names = FALSE)
+    if (identical(survival_metric_convention, "tidymodels")) {
+      eval_horizons <- if (is.null(eval_times_user)) {
+        numeric(0)
+      } else {
+        sort(unique(as.numeric(eval_times_user)))
+      }
+      eval_horizons <- eval_horizons[is.finite(eval_horizons) &
+                                       eval_horizons >= 0]
+      if (length(eval_horizons) == 0) {
+        warning(
+          "No valid eval_times supplied; time-dependent Brier metrics will be omitted.",
+          call. = FALSE
         )
-      ), digits_round))
-      eval_horizons <- eval_horizons[is.finite(eval_horizons) &
-                                       eval_horizons > 0]
+      }
+      brier_times <- eval_horizons
+      brier_metric_names <- if (length(brier_times) > 0) {
+        paste0("brier_t", seq_along(brier_times))
+      } else {
+        character(0)
+      }
+      brier_time_map <- if (length(brier_times) > 0) {
+        stats::setNames(brier_times, brier_metric_names)
+      } else {
+        numeric(0)
+      }
+      eval_times <- brier_times
+      tau_max <- if (length(eval_times) > 0) {
+        max(eval_times)
+      } else {
+        suppressWarnings(max(obs_time[is.finite(obs_time)], na.rm = TRUE))
+      }
+      if (!is.finite(tau_max) || tau_max <= 0) {
+        tau_max <- NA_real_
+      }
     } else {
-      eval_horizons <- sort(unique(as.numeric(eval_times_user)))
-      eval_horizons <- eval_horizons[is.finite(eval_horizons) &
-                                       eval_horizons > 0]
-    }
-    if (length(eval_horizons) > 0 && is.finite(tau_max)) {
-      too_late <- eval_horizons > tau_max
-      if (any(too_late)) {
-        eval_horizons <- eval_horizons[!too_late]
-        if (length(eval_horizons) == 0) {
-          warning(
-            "All requested eval_times exceed t_max; horizon-specific Brier scores will be omitted."
+      tau_max <- compute_tau_limit(obs_time, threshold)
+      if (!is.finite(tau_max) || tau_max <= 0) {
+        tau_max <- suppressWarnings(max(obs_time[is.finite(obs_time)], na.rm = TRUE))
+      }
+      if (!is.finite(tau_max) || tau_max <= 0) {
+        tau_max <- NA_real_
+      }
+
+      digits_round <- determine_round_digits(obs_time)
+      if (is.null(eval_times_user)) {
+        eval_horizons <- unique(round(c(
+          stats::median(obs_time, na.rm = TRUE),
+          as.numeric(
+            stats::quantile(obs_time, 0.75, na.rm = TRUE, names = FALSE)
           )
-        } else {
-          warning(
-            "Some requested eval_times exceed t_max and were removed for Brier score computation."
-          )
+        ), digits_round))
+        eval_horizons <- eval_horizons[is.finite(eval_horizons) &
+                                         eval_horizons > 0]
+      } else {
+        eval_horizons <- sort(unique(as.numeric(eval_times_user)))
+        eval_horizons <- eval_horizons[is.finite(eval_horizons) &
+                                         eval_horizons > 0]
+      }
+      if (length(eval_horizons) > 0 && is.finite(tau_max)) {
+        too_late <- eval_horizons > tau_max
+        if (any(too_late)) {
+          eval_horizons <- eval_horizons[!too_late]
+          if (length(eval_horizons) == 0) {
+            warning(
+              "All requested eval_times exceed t_max; horizon-specific Brier scores will be omitted."
+            )
+          } else {
+            warning(
+              "Some requested eval_times exceed t_max and were removed for Brier score computation."
+            )
+          }
         }
       }
-    }
-    brier_times <- eval_horizons
-    brier_metric_names <- if (length(brier_times) > 0) {
-      paste0("brier_t", seq_along(brier_times))
-    } else{
-      character(0)
-    }
-    brier_time_map <- if (length(brier_times) > 0) {
-      stats::setNames(brier_times, brier_metric_names)
-    } else{
-      numeric(0)
-    }
-
-    combined_times <- c(train_times, obs_time)
-    combined_times <- combined_times[is.finite(combined_times) &
-                                       combined_times > 0]
-    if (length(combined_times) > 0) {
-      eval_times <- sort(unique(combined_times))
-      if (length(eval_times) > 200) {
-        probs <- seq(0, 1, length.out = 200)
-        eval_times <- sort(unique(as.numeric(
-          stats::quantile(
-            eval_times,
-            probs = probs,
-            na.rm = TRUE,
-            type = 1
-          )
-        )))
+      brier_times <- eval_horizons
+      brier_metric_names <- if (length(brier_times) > 0) {
+        paste0("brier_t", seq_along(brier_times))
+      } else {
+        character(0)
       }
-    } else {
-      eval_times <- numeric(0)
-    }
-    special_points <- c(brier_times, tau_max, t0)
-    special_points <- special_points[is.finite(special_points) &
-                                       special_points > 0]
-    eval_times <- sort(unique(c(eval_times, special_points)))
-    if (is.finite(tau_max)) {
-      eval_times <- eval_times[eval_times <= tau_max + 1e-08]
-    }
-    if (length(eval_times) == 0 &&
-        is.finite(tau_max) && tau_max > 0) {
-      eval_times <- tau_max
+      brier_time_map <- if (length(brier_times) > 0) {
+        stats::setNames(brier_times, brier_metric_names)
+      } else {
+        numeric(0)
+      }
+
+      combined_times <- c(train_times, obs_time)
+      combined_times <- combined_times[is.finite(combined_times) &
+                                         combined_times > 0]
+      if (length(combined_times) > 0) {
+        eval_times <- sort(unique(combined_times))
+        if (length(eval_times) > 200) {
+          probs <- seq(0, 1, length.out = 200)
+          eval_times <- sort(unique(as.numeric(
+            stats::quantile(
+              eval_times,
+              probs = probs,
+              na.rm = TRUE,
+              type = 1
+            )
+          )))
+        }
+      } else {
+        eval_times <- numeric(0)
+      }
+      special_points <- c(brier_times, tau_max, t0)
+      special_points <- special_points[is.finite(special_points) &
+                                         special_points > 0]
+      eval_times <- sort(unique(c(eval_times, special_points)))
+      if (is.finite(tau_max)) {
+        eval_times <- eval_times[eval_times <= tau_max + 1e-08]
+      }
+      if (length(eval_times) == 0 &&
+          is.finite(tau_max) && tau_max > 0) {
+        eval_times <- tau_max
+      }
     }
 
     censor_eval_test <- create_censor_eval(obs_time, status_event)
@@ -1358,6 +1779,12 @@ process_model <- function(model_obj,
     }
 
     risk_group <- assign_risk_group(risk)
+    ibrier_normalize <- if (identical(survival_metric_convention, "tidymodels")) {
+      "n"
+    } else {
+      "non_missing"
+    }
+    ibrier_include_zero <- !identical(survival_metric_convention, "tidymodels")
 
     ibs_curve_full <- rep(NA_real_, length(eval_times))
     ibs_point <- NA_real_
@@ -1373,9 +1800,15 @@ process_model <- function(model_obj,
                                      obs_time,
                                      status_event,
                                      tau_max,
-                                     censor_eval_test)
+                                     censor_eval_test,
+                                     normalize_by = ibrier_normalize,
+                                     include_zero = ibrier_include_zero)
       ibs_point <- ibs_res_full$ibs
       ibs_curve_full <- ibs_res_full$curve
+      if (identical(survival_metric_convention, "tidymodels") &&
+          length(eval_times) < 2) {
+        ibs_point <- NA_real_
+      }
       brier_time_values <- map_brier_values(ibs_curve_full, eval_times, brier_times)
       rmst_diff <- compute_rmst_difference(
         obs_time,
@@ -1511,9 +1944,15 @@ process_model <- function(model_obj,
                                       obs_sub,
                                       status_sub,
                                       tau_max,
-                                      censor_eval_test)
+                                      censor_eval_test,
+                                      normalize_by = ibrier_normalize,
+                                      include_zero = ibrier_include_zero)
         ibs_sub <- clamp01(ibs_sub_res$ibs)
         curve_sub <- ibs_sub_res$curve
+        if (identical(survival_metric_convention, "tidymodels") &&
+            length(eval_times) < 2) {
+          ibs_sub <- NA_real_
+        }
       }
       brier_sub <- map_brier_values(curve_sub, eval_times, brier_times)
       if (length(brier_sub) > 0) {
@@ -1609,6 +2048,7 @@ process_model <- function(model_obj,
     attr(perf, "brier_times") <- brier_time_map
     attr(perf, "t_max") <- tau_max
     attr(perf, "at_risk_threshold") <- threshold
+    attr(perf, "survival_metric_convention") <- survival_metric_convention
     attr(data_metrics, "eval_times") <- if (limited_metrics)
       numeric(0)
     else
@@ -1621,6 +2061,7 @@ process_model <- function(model_obj,
       attr(data_metrics, "brier_times") <- brier_time_map
     }
     attr(data_metrics, "t_max") <- tau_max
+    attr(data_metrics, "survival_metric_convention") <- survival_metric_convention
 
   } else {
     # Regression task

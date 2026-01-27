@@ -29,16 +29,26 @@ train_models(
   use_default_tuning = FALSE,
   tuning_strategy = "grid",
   tuning_iterations = 10,
+  tuning_complexity = "balanced",
+  grid_levels = 3L,
   early_stopping = FALSE,
   adaptive = FALSE,
   algorithm_engines = NULL,
+  use_parsnip_defaults = FALSE,
+  warn_engine_defaults = TRUE,
+  n_cores = 1,
+  verbose = FALSE,
   event_class = "first",
+  class_threshold = "auto",
   start_col = NULL,
   time_col = NULL,
   status_col = NULL,
   eval_times = NULL,
   at_risk_threshold = 0.1,
-  audit_env = NULL
+  survival_metric_convention = "fastml",
+  audit_env = NULL,
+  multiclass_auc = "macro",
+  store_fold_models = FALSE
 )
 }
 \arguments{
@@ -98,7 +108,9 @@ Use this to control options like \code{ties = "breslow"} for Cox models or
 \code{importance = "impurity"} for ranger. Unlike \code{tune_params}, these
 values are not tuned over a grid.}
 
-\item{metric}{The performance metric to optimize.}
+\item{metric}{The performance metric to optimize. For classification, options
+include \code{"accuracy"}, \code{"roc_auc"}, \code{"logloss"},
+\code{"brier_score"}, and \code{"ece"} (plus other class metrics).}
 
 \item{summaryFunction}{A custom summary function for model evaluation. Default is \code{NULL}.}
 
@@ -119,14 +131,40 @@ they will be ignored with a warning.}
 when \code{tuning_strategy} is not \code{"bayes"}; validation occurs only
 for the Bayesian strategy.}
 
+\item{tuning_complexity}{Character string specifying tuning complexity preset.
+One of "quick", "balanced", "thorough", or "exhaustive". Controls both
+grid density and parameter range width.}
+
+\item{grid_levels}{Integer specifying number of levels per parameter for
+grid search. Higher values create denser grids but increase computation
+exponentially (grid size = levels^n_params).}
+
 \item{early_stopping}{Logical for early stopping in Bayesian tuning.}
 
 \item{adaptive}{Logical indicating whether to use adaptive/racing methods.}
 
 \item{algorithm_engines}{A named list specifying the engine to use for each algorithm.}
 
+\item{use_parsnip_defaults}{Logical. If \code{TRUE}, use parsnip's default engines
+instead of fastml's optimized defaults. Default is \code{FALSE}.}
+
+\item{warn_engine_defaults}{Logical. If \code{TRUE} (default), warn when fastml's
+default engine differs from parsnip's default.}
+
+\item{n_cores}{Integer number of cores requested for parallel processing.
+Used to decide whether tuning/resampling should run in parallel and to
+configure engine thread settings when supported.}
+
+\item{verbose}{Logical. If \code{TRUE}, print informational messages about
+engine selection and parameter overrides.}
+
 \item{event_class}{Character string identifying the positive class when computing
 classification metrics ("first" or "second").}
+
+\item{class_threshold}{For binary classification, controls how class probabilities
+are converted into hard class predictions during evaluation. Numeric values in
+(0, 1) set a fixed threshold. The default `"auto"` tunes a threshold on the
+training data to maximize F1; use `"model"` to keep the model's default threshold.}
 
 \item{start_col}{Optional name of the survival start time column passed through
 to downstream evaluation helpers.}
@@ -140,10 +178,25 @@ to downstream evaluation helpers.}
 \item{at_risk_threshold}{Numeric cutoff used to determine the evaluation window
 for survival metrics within guarded resampling.}
 
+\item{survival_metric_convention}{Character string specifying which survival
+metric conventions to follow. `"fastml"` (default) uses fastml's internal
+defaults for evaluation horizons and t_max. `"tidymodels"` uses
+`eval_times` as the explicit evaluation grid and applies yardstick-style
+Brier/IBS normalization; when `eval_times` is `NULL`, time-dependent Brier
+metrics are omitted.}
+
 \item{audit_env}{Internal environment that tracks security audit findings when
 custom preprocessing hooks are executed. Typically supplied by
 \code{fastml()} and should be left as \code{NULL} when calling
 \code{train_models()} directly.}
+
+\item{multiclass_auc}{For multiclass ROC AUC, the averaging method to use:
+`"macro"` (default, tidymodels) or `"macro_weighted"`. Macro weights each
+class equally, while macro_weighted weights by class prevalence and can
+change model rankings on imbalanced data.}
+
+\item{store_fold_models}{Logical. If \code{TRUE}, store the fitted fold models
+during resampling for later inspection or stability analysis.}
 }
 \value{
 A list of trained model objects.

@@ -123,6 +123,47 @@ make_grouped_cv <- function(data, group_cols, v = 5, strata = NULL, repeats = 1)
   resamples
 }
 
+fastml_tuning_seed <- function(seed, offset = 0L) {
+  if (is.null(seed) || length(seed) == 0 || is.na(seed[[1]])) {
+    return(NULL)
+  }
+  base_seed <- as.integer(seed[[1]])
+  if (!is.finite(base_seed)) {
+    return(NULL)
+  }
+  offset <- as.integer(offset[[1]])
+  if (!is.finite(offset)) {
+    offset <- 0L
+  }
+  seed_out <- base_seed + offset
+  seed_out <- abs(seed_out %% .Machine$integer.max)
+  if (!is.finite(seed_out) || seed_out == 0L) {
+    seed_out <- abs(base_seed)
+  }
+  seed_out
+}
+
+fastml_with_seed <- function(seed, fn) {
+  if (is.null(seed) || length(seed) == 0 || is.na(seed[[1]])) {
+    return(fn())
+  }
+  seed <- as.integer(seed[[1]])
+  if (!is.finite(seed)) {
+    return(fn())
+  }
+  has_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  old_seed <- if (has_seed) get(".Random.seed", envir = .GlobalEnv, inherits = FALSE) else NULL
+  on.exit({
+    if (has_seed) {
+      assign(".Random.seed", old_seed, envir = .GlobalEnv)
+    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      rm(".Random.seed", envir = .GlobalEnv)
+    }
+  }, add = TRUE)
+  set.seed(seed)
+  fn()
+}
+
 make_blocked_cv <- function(data, block_col, block_size) {
   if (is.null(block_col) || length(block_col) != 1) {
     stop("'block_col' must be provided when using blocked resampling.")
@@ -271,8 +312,8 @@ make_nested_cv <- function(data,
 }
 
 fastml_nested_strip_meta <- function(param_tbl) {
-  meta_cols <- c(".metric", ".estimator", ".config", ".notes", ".iter", ".order",
-                 "mean", "n", "std_err")
+  meta_cols <- c(".metric", ".estimator", ".estimate", ".config", ".notes", ".iter", ".order",
+                 ".eval_time", "mean", "n", "std_dev", "std_err", "id", "id2", "fold")
   keep <- setdiff(names(param_tbl), meta_cols)
   if (length(keep) == 0) {
     return(NULL)
@@ -298,24 +339,126 @@ fastml_nested_signature <- function(param_tbl) {
   paste(names(vals), vals, sep = "=", collapse = "||")
 }
 
-fastml_nested_select_params <- function(best_params_list) {
-  if (length(best_params_list) == 0) {
+fastml_nested_select_params <- function(inner_results,
+                                        metric,
+                                        lower_is_better,
+                                        summary_fn = mean) {
+  if (length(inner_results) == 0) {
     return(NULL)
   }
-  params <- best_params_list[!vapply(best_params_list, is.null, logical(1))]
-  if (length(params) == 0) {
+
+  metrics_list <- lapply(inner_results, function(entry) {
+    if (is.null(entry)) {
+      return(NULL)
+    }
+    metrics_tbl <- NULL
+    if (is.data.frame(entry) && all(c(".metric", ".estimate") %in% names(entry))) {
+      metrics_tbl <- entry
+    } else {
+      metrics_tbl <- tryCatch(
+        tune::collect_metrics(entry, summarize = FALSE),
+        error = function(e) NULL
+      )
+    }
+    if (is.null(metrics_tbl) || nrow(metrics_tbl) == 0) {
+      return(NULL)
+    }
+    metrics_tbl
+  })
+
+  metrics_list <- metrics_list[!vapply(metrics_list, is.null, logical(1))]
+  if (length(metrics_list) == 0) {
     return(NULL)
   }
-  stripped <- lapply(params, fastml_nested_strip_meta)
-  stripped <- stripped[!vapply(stripped, is.null, logical(1))]
-  if (length(stripped) == 0) {
+
+  metrics_tbl <- dplyr::bind_rows(metrics_list)
+  if (!".metric" %in% names(metrics_tbl) || !".estimate" %in% names(metrics_tbl)) {
     return(NULL)
   }
-  signatures <- vapply(stripped, fastml_nested_signature, character(1))
-  counts <- table(signatures)
-  top_signature <- names(counts)[which.max(counts)]
-  idx <- match(top_signature, signatures)
-  stripped[[idx]]
+
+  metrics_tbl <- metrics_tbl[metrics_tbl$.metric == metric, , drop = FALSE]
+  if (nrow(metrics_tbl) == 0) {
+    return(NULL)
+  }
+
+  param_tbl <- fastml_nested_strip_meta(metrics_tbl)
+  if (is.null(param_tbl) || nrow(param_tbl) == 0) {
+    return(NULL)
+  }
+
+  param_cols <- sort(names(param_tbl))
+  group_cols <- param_cols
+  has_estimator <- ".estimator" %in% names(metrics_tbl)
+  if (has_estimator) {
+    group_cols <- c(group_cols, ".estimator")
+  }
+
+  aggregated <- metrics_tbl %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(group_cols))) %>%
+    dplyr::summarise(
+      .estimate = summary_fn(.data$.estimate, na.rm = TRUE),
+      n = sum(is.finite(.data$.estimate)),
+      std_dev = stats::sd(.data$.estimate, na.rm = TRUE),
+      std_err = ifelse(n > 0, std_dev / sqrt(n), NA_real_),
+      .groups = "drop"
+    )
+
+  aggregated <- aggregated[is.finite(aggregated$.estimate), , drop = FALSE]
+  if (nrow(aggregated) == 0) {
+    return(NULL)
+  }
+
+  params_only <- fastml_nested_strip_meta(aggregated)
+  if (is.null(params_only) || nrow(params_only) == 0) {
+    return(NULL)
+  }
+  params_only <- params_only[, param_cols, drop = FALSE]
+
+  signatures <- vapply(
+    seq_len(nrow(params_only)),
+    function(i) fastml_nested_signature(params_only[i, , drop = FALSE]),
+    character(1)
+  )
+  aggregated$._signature <- signatures
+
+  # Tie-breaking: best aggregate metric, then lower std_err, then estimator/signature ordering.
+  if (has_estimator) {
+    if (lower_is_better) {
+      ordered <- dplyr::arrange(
+        aggregated,
+        .data$.estimate,
+        .data$std_err,
+        .data$.estimator,
+        .data$._signature
+      )
+    } else {
+      ordered <- dplyr::arrange(
+        aggregated,
+        dplyr::desc(.data$.estimate),
+        .data$std_err,
+        .data$.estimator,
+        .data$._signature
+      )
+    }
+  } else {
+    if (lower_is_better) {
+      ordered <- dplyr::arrange(
+        aggregated,
+        .data$.estimate,
+        .data$std_err,
+        .data$._signature
+      )
+    } else {
+      ordered <- dplyr::arrange(
+        aggregated,
+        dplyr::desc(.data$.estimate),
+        .data$std_err,
+        .data$._signature
+      )
+    }
+  }
+
+  tibble::as_tibble(ordered[1, param_cols, drop = FALSE])
 }
 
 fastml_run_nested_cv <- function(workflow_spec,
@@ -339,13 +482,16 @@ fastml_run_nested_cv <- function(workflow_spec,
                                  my_metrics,
                                  do_tuning,
                                  event_class,
+                                 class_threshold,
                                  start_col,
                                  time_col,
                                  status_col,
                                  eval_times,
                                  at_risk_threshold,
                                  seed,
-                                 update_params_fn) {
+                                 update_params_fn,
+                                 multiclass_auc = "macro",
+                                 grid_levels = 3L) {
   if (!inherits(nested_resamples, "rset") ||
       is.null(nested_resamples$inner_resamples)) {
     stop("'nested_resamples' must be a nested resampling object with inner resamples.")
@@ -371,7 +517,7 @@ fastml_run_nested_cv <- function(workflow_spec,
   lower_is_better <- if (!is.na(metric_direction) && !is.null(metric_direction)) {
     identical(metric_direction, "minimize")
   } else {
-    metric %in% c("rmse", "mae", "ibs", "logloss", "mse", "brier_score") ||
+    metric %in% c("rmse", "mae", "ibs", "logloss", "mse", "brier_score", "ece") ||
       grepl("brier", metric, fixed = TRUE)
   }
 
@@ -379,6 +525,12 @@ fastml_run_nested_cv <- function(workflow_spec,
     current_split <- outer_splits[[i]]
     if (is.null(current_split)) {
       next
+    }
+
+    tuning_seed <- fastml_tuning_seed(seed, offset = i)
+    ctrl_bayes_current <- ctrl_bayes
+    if (!is.null(tuning_seed) && inherits(ctrl_bayes_current, "control_bayes")) {
+      ctrl_bayes_current$seed <- tuning_seed
     }
 
     inner_resamples <- inner_list[[i]]
@@ -408,29 +560,32 @@ fastml_run_nested_cv <- function(workflow_spec,
       grid_current <- NULL
       if (!is.null(params_current) && nrow(params_current) > 0) {
         if (tuning_strategy == "grid" && !adaptive) {
-          grid_current <- grid_regular(params_current, levels = 3)
+          grid_current <- grid_regular(params_current, levels = grid_levels)
         }
       }
 
-      tuning_args <- c(
-        list(
-          object = workflow_spec,
-          resamples = inner_resamples,
-          metrics = if (!is.null(my_metrics)) my_metrics else metrics
-        ),
-        engine_args
+      # Note: engine_args are already embedded in workflow_spec via set_engine(),
+      # so we don't pass them here. Tuning functions don't accept extra arguments.
+      tuning_args <- list(
+        object = workflow_spec,
+        resamples = inner_resamples,
+        metrics = if (!is.null(my_metrics)) my_metrics else metrics
       )
 
       if (tuning_strategy == "bayes") {
         tuning_args$param_info <- params_current
         tuning_args$iter <- tuning_iterations
-        tuning_args$control <- ctrl_bayes
-        model_tuned <- do.call(tune_bayes, tuning_args)
+        tuning_args$control <- ctrl_bayes_current
+        model_tuned <- fastml_with_seed(tuning_seed, function() {
+          do.call(tune_bayes, tuning_args)
+        })
       } else if (adaptive) {
         tuning_args$param_info <- params_current
         tuning_args$grid <- if (is.null(grid_current)) 20 else grid_current
         tuning_args$control <- ctrl_race
-        model_tuned <- do.call(tune_race_anova, tuning_args)
+        model_tuned <- fastml_with_seed(tuning_seed, function() {
+          do.call(tune_race_anova, tuning_args)
+        })
       } else {
         grid_arg <- if (!is.null(grid_current)) {
           grid_current
@@ -439,7 +594,9 @@ fastml_run_nested_cv <- function(workflow_spec,
         }
         tuning_args$grid <- grid_arg
         tuning_args$control <- ctrl_grid
-        model_tuned <- do.call(tune::tune_grid, tuning_args)
+        model_tuned <- fastml_with_seed(tuning_seed, function() {
+          do.call(tune::tune_grid, tuning_args)
+        })
       }
 
       inner_results[[i]] <- model_tuned
@@ -454,10 +611,9 @@ fastml_run_nested_cv <- function(workflow_spec,
     }
 
     fitted_outer <- tryCatch({
-      do.call(
-        parsnip::fit,
-        c(list(object = current_workflow, data = outer_train), engine_args)
-      )
+      fastml_with_seed(tuning_seed, function() {
+        parsnip::fit(current_workflow, data = outer_train)
+      })
     }, error = function(e) {
       warning(sprintf("Outer fit failed for split '%s': %s", outer_ids[[i]], e$message))
       NULL
@@ -472,6 +628,7 @@ fastml_run_nested_cv <- function(workflow_spec,
             test_data = outer_assess,
             label = label,
             event_class = event_class,
+            class_threshold = class_threshold,
             start_col = start_col,
             time_col = time_col,
             status_col = status_col,
@@ -483,7 +640,9 @@ fastml_run_nested_cv <- function(workflow_spec,
             bootstrap_ci = FALSE,
             bootstrap_samples = 1,
             bootstrap_seed = seed,
-            at_risk_threshold = at_risk_threshold
+            at_risk_threshold = at_risk_threshold,
+            survival_metric_convention = survival_metric_convention,
+            multiclass_auc = multiclass_auc
           )
         }, error = function(e) {
         warning(sprintf("Evaluation failed for outer split '%s': %s", outer_ids[[i]], e$message))
@@ -492,7 +651,10 @@ fastml_run_nested_cv <- function(workflow_spec,
 
       if (!is.null(eval_result) && !is.null(eval_result$performance)) {
         outer_metrics[[i]] <- eval_result$performance %>%
-          dplyr::mutate(outer_id = outer_ids[[i]])
+          dplyr::mutate(
+            outer_id = outer_ids[[i]],
+            .n = nrow(outer_assess)
+          )
       }
     }
   }
@@ -507,19 +669,51 @@ fastml_run_nested_cv <- function(workflow_spec,
   final_params <- NULL
   selected_outer_id <- NULL
   if (do_tuning) {
-    final_params <- fastml_nested_select_params(best_params_list)
+    final_params <- fastml_nested_select_params(
+      inner_results = inner_results,
+      metric = metric,
+      lower_is_better = lower_is_better
+    )
   }
 
-  final_workflow <- if (!is.null(final_params)) {
+  if (do_tuning && (is.null(final_params) || !is.data.frame(final_params) || nrow(final_params) == 0)) {
+    params_final <- tune_params_template
+    if (!is.null(params_final)) {
+      params_final <- tryCatch(
+        finalize(
+          params_final,
+          x = train_data %>% dplyr::select(-dplyr::all_of(label))
+        ),
+        error = function(e) NULL
+      )
+    }
+    if (!is.null(params_final) && !is.null(engine_tune_params)) {
+      params_final <- update_params_fn(params_final, engine_tune_params)
+    }
+    if (!is.null(params_final) && nrow(params_final) > 0) {
+      fallback_grid <- tryCatch(
+        grid_regular(params_final, levels = grid_levels),
+        error = function(e) NULL
+      )
+      if (!is.null(fallback_grid) && nrow(fallback_grid) > 0) {
+        final_params <- fallback_grid[1, , drop = FALSE]
+        warning(
+          "Nested tuning failed to select parameters; using the first available grid configuration.",
+          call. = FALSE
+        )
+      }
+    }
+  }
+
+  final_workflow <- if (!is.null(final_params) && is.data.frame(final_params) && nrow(final_params) > 0) {
     finalize_workflow(workflow_spec, final_params)
   } else {
     workflow_spec
   }
 
-  final_model <- do.call(
-    parsnip::fit,
-    c(list(object = final_workflow, data = train_data), engine_args)
-  )
+  final_model <- fastml_with_seed(seed, function() {
+    parsnip::fit(final_workflow, data = train_data)
+  })
 
   list(
     final_model = final_model,
@@ -530,6 +724,119 @@ fastml_run_nested_cv <- function(workflow_spec,
       selected_outer_id = selected_outer_id
     )
   )
+}
+
+fastml_filter_tune_metrics <- function(metrics_tbl, best_params) {
+  if (is.null(metrics_tbl) || !is.data.frame(metrics_tbl) || nrow(metrics_tbl) == 0) {
+    return(metrics_tbl)
+  }
+  if (is.null(best_params) || !is.data.frame(best_params) || nrow(best_params) == 0) {
+    return(metrics_tbl)
+  }
+
+  param_cols <- intersect(names(best_params), names(metrics_tbl))
+  if (length(param_cols) == 0) {
+    return(metrics_tbl)
+  }
+
+  non_param <- c(".metric", ".estimator", "mean", "n", "std_err", ".estimate",
+                 "id", "fold", ".iter", ".order")
+  param_cols <- setdiff(param_cols, non_param)
+  if (length(param_cols) == 0 && ".config" %in% names(best_params) &&
+      ".config" %in% names(metrics_tbl)) {
+    param_cols <- ".config"
+  }
+  if (length(param_cols) == 0) {
+    return(metrics_tbl)
+  }
+
+  dplyr::semi_join(metrics_tbl, best_params, by = param_cols)
+}
+
+fastml_attach_fold_sizes <- function(res_summary, resamples, task) {
+  if (is.null(res_summary) || !is.list(res_summary)) {
+    return(res_summary)
+  }
+  folds_tbl <- res_summary$folds
+  if (is.null(folds_tbl) || !is.data.frame(folds_tbl) || nrow(folds_tbl) == 0) {
+    return(res_summary)
+  }
+  if (".n" %in% names(folds_tbl)) {
+    res_summary$aggregated <- fastml_aggregate_resample_metrics(folds_tbl, task)
+    return(res_summary)
+  }
+
+  splits <- resamples
+  if (fastml_is_resample_plan(splits)) {
+    splits <- fastml_resample_splits(splits)
+  }
+  if (is.null(splits) || !inherits(splits, "rset")) {
+    return(res_summary)
+  }
+  split_list <- splits$splits
+  if (length(split_list) == 0) {
+    return(res_summary)
+  }
+
+  fold_sizes <- vapply(split_list, function(split) {
+    assess <- tryCatch(rsample::assessment(split), error = function(e) NULL)
+    if (is.null(assess)) {
+      return(NA_real_)
+    }
+    nrow(assess)
+  }, numeric(1))
+  size_tbl <- tibble::tibble(
+    fold = as.character(seq_along(fold_sizes)),
+    .n = as.numeric(fold_sizes)
+  )
+
+  if (!"fold" %in% names(folds_tbl)) {
+    folds_tbl$fold <- as.character(seq_len(nrow(folds_tbl)))
+  } else {
+    folds_tbl$fold <- as.character(folds_tbl$fold)
+  }
+  folds_tbl <- dplyr::left_join(folds_tbl, size_tbl, by = "fold")
+  res_summary$folds <- folds_tbl
+  res_summary$aggregated <- fastml_aggregate_resample_metrics(folds_tbl, task)
+  res_summary
+}
+
+fastml_collect_tune_resample_summary <- function(tune_results, best_params, task) {
+  # First, collect per-fold metrics (unsummarized)
+  folds_tbl <- tryCatch(
+    tune::collect_metrics(tune_results, summarize = FALSE),
+    error = function(e) NULL
+  )
+
+  if (is.null(folds_tbl) || nrow(folds_tbl) == 0) {
+    return(NULL)
+  }
+
+  folds_tbl <- fastml_filter_tune_metrics(folds_tbl, best_params)
+  if (is.null(folds_tbl) || nrow(folds_tbl) == 0) {
+    return(NULL)
+  }
+
+  # Rename id to fold for consistency
+ if ("id" %in% names(folds_tbl)) {
+    folds_tbl <- dplyr::rename(folds_tbl, fold = .data$id)
+  }
+
+  # Drop unnecessary columns
+  drop_cols <- intersect(names(folds_tbl), c(".config", ".iter", ".order"))
+  if (length(drop_cols) > 0) {
+    folds_tbl <- folds_tbl[, setdiff(names(folds_tbl), drop_cols), drop = FALSE]
+  }
+
+  if (identical(task, "survival") && ".estimator" %in% names(folds_tbl)) {
+    folds_tbl <- folds_tbl[, setdiff(names(folds_tbl), ".estimator"), drop = FALSE]
+  }
+
+  # Compute aggregated metrics (mean, SD, SE) from fold-level data
+  # This ensures proper CV statistics instead of using pooled metrics
+  aggregated <- fastml_aggregate_resample_metrics(folds_tbl, task)
+
+  list(aggregated = aggregated, folds = folds_tbl)
 }
 
 #' Train Specified Machine Learning Algorithms on the Training Data
@@ -576,7 +883,9 @@ fastml_run_nested_cv <- function(workflow_spec,
 #'   Use this to control options like \code{ties = "breslow"} for Cox models or
 #'   \code{importance = "impurity"} for ranger. Unlike \code{tune_params}, these
 #'   values are not tuned over a grid.
-#' @param metric The performance metric to optimize.
+#' @param metric The performance metric to optimize. For classification, options
+#'   include \code{"accuracy"}, \code{"roc_auc"}, \code{"logloss"},
+#'   \code{"brier_score"}, and \code{"ece"} (plus other class metrics).
 #' @param summaryFunction A custom summary function for model evaluation. Default is \code{NULL}.
 #' @param seed An integer value specifying the random seed for reproducibility.
 #' @param recipe A recipe object for preprocessing.
@@ -590,11 +899,34 @@ fastml_run_nested_cv <- function(workflow_spec,
 #' @param tuning_iterations Number of iterations for Bayesian tuning. Ignored
 #'   when \code{tuning_strategy} is not \code{"bayes"}; validation occurs only
 #'   for the Bayesian strategy.
+#' @param tuning_complexity Character string specifying tuning complexity preset.
+#'   One of "quick", "balanced", "thorough", or "exhaustive". Controls both
+#'   grid density and parameter range width.
+#' @param grid_levels Integer specifying number of levels per parameter for
+#'   grid search. Higher values create denser grids but increase computation
+#'   exponentially (grid size = levels^n_params).
 #' @param early_stopping Logical for early stopping in Bayesian tuning.
 #' @param adaptive Logical indicating whether to use adaptive/racing methods.
 #' @param algorithm_engines A named list specifying the engine to use for each algorithm.
+#' @param use_parsnip_defaults Logical. If \code{TRUE}, use parsnip's default engines
+#'   instead of fastml's optimized defaults. Default is \code{FALSE}.
+#' @param warn_engine_defaults Logical. If \code{TRUE} (default), warn when fastml's
+#'   default engine differs from parsnip's default.
+#' @param n_cores Integer number of cores requested for parallel processing.
+#'   Used to decide whether tuning/resampling should run in parallel and to
+#'   configure engine thread settings when supported.
+#' @param verbose Logical. If \code{TRUE}, print informational messages about
+#'   engine selection and parameter overrides.
 #' @param event_class Character string identifying the positive class when computing
 #'   classification metrics ("first" or "second").
+#' @param class_threshold For binary classification, controls how class probabilities
+#'   are converted into hard class predictions during evaluation. Numeric values in
+#'   (0, 1) set a fixed threshold. The default `"auto"` tunes a threshold on the
+#'   training data to maximize F1; use `"model"` to keep the model's default threshold.
+#' @param multiclass_auc For multiclass ROC AUC, the averaging method to use:
+#'   `"macro"` (default, tidymodels) or `"macro_weighted"`. Macro weights each
+#'   class equally, while macro_weighted weights by class prevalence and can
+#'   change model rankings on imbalanced data.
 #' @param start_col Optional name of the survival start time column passed through
 #'   to downstream evaluation helpers.
 #' @param time_col Optional name of the survival stop time column.
@@ -602,6 +934,14 @@ fastml_run_nested_cv <- function(workflow_spec,
 #' @param eval_times Optional numeric vector of time horizons for survival metrics.
 #' @param at_risk_threshold Numeric cutoff used to determine the evaluation window
 #'   for survival metrics within guarded resampling.
+#' @param survival_metric_convention Character string specifying which survival
+#'   metric conventions to follow. `"fastml"` (default) uses fastml's internal
+#'   defaults for evaluation horizons and t_max. `"tidymodels"` uses
+#'   `eval_times` as the explicit evaluation grid and applies yardstick-style
+#'   Brier/IBS normalization; when `eval_times` is `NULL`, time-dependent Brier
+#'   metrics are omitted.
+#' @param store_fold_models Logical. If \code{TRUE}, store the fitted fold models
+#'   during resampling for later inspection or stability analysis.
 #' @param audit_env Internal environment that tracks security audit findings when
 #'   custom preprocessing hooks are executed. Typically supplied by
 #'   \code{fastml()} and should be left as \code{NULL} when calling
@@ -647,22 +987,59 @@ train_models <- function(train_data,
                          use_default_tuning = FALSE,
                          tuning_strategy = "grid",
                          tuning_iterations = 10,
+                         tuning_complexity = "balanced",
+                         grid_levels = 3L,
                          early_stopping = FALSE,
                          adaptive = FALSE,
                          algorithm_engines = NULL,
+                         use_parsnip_defaults = FALSE,
+                         warn_engine_defaults = TRUE,
+                         n_cores = 1,
+                         verbose = FALSE,
                          event_class = "first",
+                         class_threshold = "auto",
                          start_col = NULL,
                          time_col = NULL,
                          status_col = NULL,
                          eval_times = NULL,
                          at_risk_threshold = 0.1,
-                         audit_env = NULL) {
+                         survival_metric_convention = "fastml",
+                         audit_env = NULL,
+                         multiclass_auc = "macro",
+                         store_fold_models = FALSE) {
+  survival_metric_convention <- fastml_normalize_survival_convention(survival_metric_convention)
 
   set.seed(seed)
+
+  n_cores_val <- fastml_normalize_threads(n_cores)
+  allow_par_base <- !is.null(n_cores_val) && n_cores_val > 1L
+  determinism_warnings <- list()
+  add_determinism_warning <- function(algo, engine, engine_args) {
+    reason <- fastml_engine_determinism_warning(algo, engine, task, n_cores_val, engine_args)
+    if (!is.null(reason)) {
+      determinism_warnings[[length(determinism_warnings) + 1]] <<- list(
+        algo = algo,
+        engine = engine,
+        reason = reason
+      )
+    }
+  }
 
   if (is.null(audit_env) || !is.environment(audit_env)) {
     audit_env <- fastml_init_audit_env(FALSE)
   }
+
+  multiclass_auc <- fastml_normalize_multiclass_auc(multiclass_auc)
+  roc_auc <- fastml_configured_roc_auc(multiclass_auc, event_class = event_class)
+  accuracy_metric <- fastml_wrap_basic_metric(accuracy)
+  kap_metric <- fastml_wrap_basic_metric(kap)
+  sens_metric <- fastml_wrap_event_level_metric(sens, event_class)
+  spec_metric <- fastml_wrap_event_level_metric(spec, event_class)
+  precision_metric <- fastml_wrap_event_level_metric(precision, event_class)
+  f_meas_metric <- fastml_wrap_event_level_metric(f_meas, event_class)
+  logloss_metric <- fastml_configured_logloss(event_class = event_class)
+  brier_metric <- fastml_configured_brier_score(event_class = event_class)
+  ece_metric <- fastml_configured_ece(event_class = event_class)
 
   tuning_strategy <- match.arg(tuning_strategy, c("grid", "bayes", "none"))
 
@@ -723,6 +1100,7 @@ train_models <- function(train_data,
 
   if (task == "survival") {
     models <- list()
+    failed_models <- list()
 
     update_params_surv <- function(params_model, new_params) {
       for (param_name in names(new_params)) {
@@ -970,12 +1348,38 @@ train_models <- function(train_data,
     time_col <- if (length(label_cols) == 3) label_cols[2] else label_cols[1]
     status_col <- label_cols[length(label_cols)]
 
-    get_engine <- function(algo, default_engine) {
+    get_engine <- function(algo, fastml_default_engine) {
+      # If user explicitly specified engine, use it without warning
       if (!is.null(algorithm_engines) && !is.null(algorithm_engines[[algo]])) {
+        if (verbose) {
+          message(sprintf("[%s] Using user-specified engine: '%s'", algo, algorithm_engines[[algo]]))
+        }
         return(algorithm_engines[[algo]])
-      } else {
-        return(default_engine)
       }
+
+      # Determine which default to use
+      if (use_parsnip_defaults) {
+        parsnip_default <- get_parsnip_default_engine(algo, task)
+        if (!is.null(parsnip_default)) {
+          if (verbose) {
+            message(sprintf("[%s] Using parsnip default engine: '%s'", algo, parsnip_default))
+          }
+          return(parsnip_default)
+        }
+        # Fall back to fastml default if no parsnip default exists
+        if (verbose) {
+          message(sprintf("[%s] No parsnip default found, using fastml default: '%s'", algo, fastml_default_engine))
+        }
+        return(fastml_default_engine)
+      }
+
+      # Using fastml default - warn if it differs from parsnip
+      if (warn_engine_defaults) {
+        warn_default_override(algo, task, fastml_default_engine, verbose = verbose)
+      } else if (verbose) {
+        message(sprintf("[%s] Using fastml default engine: '%s'", algo, fastml_default_engine))
+      }
+      return(fastml_default_engine)
     }
 
     rec_prep_cache <- NULL
@@ -1013,6 +1417,10 @@ train_models <- function(train_data,
       prefer_parsnip <- !is.null(resamples) || !identical(resampling_method, "none") ||
         use_default_tuning || (!is.null(tune_params) && length(tune_params) > 0)
       spec_is_parsnip <- FALSE
+      apply_seed_defaults <- function() {
+        engine_args <<- fastml_apply_engine_seed(engine_args, algo, engine, seed, n_cores_val, task)
+        add_determinism_warning(algo, engine, engine_args)
+      }
 
       if (algo %in% c("rand_forest", "rand_forest_survival")) {
         if (identical(engine, "aorsf") && !requireNamespace("aorsf", quietly = TRUE)) {
@@ -1028,6 +1436,7 @@ train_models <- function(train_data,
           warning("Package 'censored' not installed; skipping survival random forest parsnip model.")
           next
         }
+        apply_seed_defaults()
         spec <- define_rand_forest_spec("survival", train_data, label,
                                        tuning = FALSE, engine = engine)$model_spec
         spec_is_parsnip <- TRUE
@@ -1038,6 +1447,7 @@ train_models <- function(train_data,
         if (!requireNamespace("survival", quietly = TRUE)) {
           stop("The 'survival' package is required for Cox PH. Please install it.")
         }
+        apply_seed_defaults()
         if (prefer_parsnip) {
           base_spec <- parsnip::proportional_hazards(
             penalty = NULL,
@@ -1069,6 +1479,8 @@ train_models <- function(train_data,
         if (!requireNamespace("glmnet", quietly = TRUE)) {
           stop("The 'glmnet' package is required for penalized_cox. Please install it.")
         }
+
+        apply_seed_defaults()
 
         defaults <- get_default_params("penalized_cox", task, engine = engine)
         penalty_val <- defaults$penalty
@@ -1114,6 +1526,7 @@ train_models <- function(train_data,
           next
         }
         engine <- engine_name
+        apply_seed_defaults()
 
         if (!is.null(start_col)) {
           warning("XGBoost AFT does not support start-stop survival outcomes; skipping.")
@@ -1199,7 +1612,12 @@ train_models <- function(train_data,
             next
           }
 
-          time_vec[time_vec <= 0 | !is.finite(time_vec)] <- min(time_vec[time_vec > 0 & is.finite(time_vec)])
+          if (any(!is.finite(time_vec) | time_vec <= 0)) {
+            stop(
+              "XGBoost AFT requires strictly positive, finite survival times. Remove or correct invalid times before fitting.",
+              call. = FALSE
+            )
+          }
           log_time <- log(time_vec)
           lower_bounds <- log_time
           upper_bounds <- log_time
@@ -1249,6 +1667,24 @@ train_models <- function(train_data,
             aft_loss_distribution_scale = 1,
             verbosity = 0
           )
+
+          seed_val <- fastml_normalize_seed(seed)
+          if (!is.null(engine_args$seed)) {
+            seed_val <- engine_args$seed[[1]]
+            engine_args$seed <- NULL
+          }
+          if (!is.null(seed_val) && is.null(params$seed)) {
+            params$seed <- seed_val
+          }
+
+          threads_val <- n_cores_val
+          if (!is.null(engine_args$nthread)) {
+            threads_val <- as.integer(engine_args$nthread[[1]])
+            engine_args$nthread <- NULL
+          }
+          if (!is.null(threads_val) && is.null(params$nthread)) {
+            params$nthread <- threads_val
+          }
 
           aft_quantiles <- c(0.25, 0.5, 0.75)
           early_stop <- defaults$stop_iter
@@ -1310,7 +1746,9 @@ train_models <- function(train_data,
             train_args$early_stopping_rounds <- as.integer(early_stop)
           }
 
-          booster <- do.call(xgboost::xgb.train, train_args)
+          booster <- fastml_with_seed(seed_val, function() {
+            do.call(xgboost::xgb.train, train_args)
+          })
 
           aft_distribution <- params$aft_loss_distribution
           if (is.null(aft_distribution) || !nzchar(as.character(aft_distribution)[1])) {
@@ -1336,6 +1774,16 @@ train_models <- function(train_data,
       } else if (algo == "stratified_cox") {
         if (!requireNamespace("survival", quietly = TRUE)) {
           stop("The 'survival' package is required for stratified Cox. Please install it.")
+        }
+        apply_seed_defaults()
+        # Native-only model: warn if resampling was requested
+        if (prefer_parsnip) {
+          warning(
+            "Stratified Cox uses native survival::coxph() which does not support ",
+            "tidymodels resampling. Preprocessing will be applied to full training data. ",
+            "Cross-validation metrics will not be available for this model.",
+            call. = FALSE
+          )
         }
         strata_cols <- names(train_data)[grepl("^strata", names(train_data))]
         if (length(strata_cols) == 0) {
@@ -1440,6 +1888,16 @@ train_models <- function(train_data,
         if (!requireNamespace("survival", quietly = TRUE)) {
           stop("The 'survival' package is required for time-varying Cox. Please install it.")
         }
+        apply_seed_defaults()
+        # Native-only model: warn if resampling was requested
+        if (prefer_parsnip) {
+          warning(
+            "Time-varying Cox uses native survival::coxph() which does not support ",
+            "tidymodels resampling. Preprocessing will be applied to full training data. ",
+            "Cross-validation metrics will not be available for this model.",
+            call. = FALSE
+          )
+        }
         prep_dat <- get_prepped_data()
         baked_train <- prep_dat$data
         rec_prep <- prep_dat$recipe
@@ -1457,21 +1915,9 @@ train_models <- function(train_data,
         if (!requireNamespace("survival", quietly = TRUE)) {
           stop("The 'survival' package is required for survreg. Please install it.")
         }
-        prep_dat <- get_prepped_data()
-        baked_train <- prep_dat$data
-        rec_prep <- prep_dat$recipe
-        fit <- call_with_engine_params(
-          survival::survreg,
-          list(
-            formula = as.formula(paste(response_col, "~ .")),
-            data = baked_train,
-            dist = "weibull"
-          ),
-          engine_args
-        )
-        spec <- create_native_spec("survreg", engine, fit, rec_prep,
-                                   extras = list(distribution = "weibull"))
+        apply_seed_defaults()
         if (prefer_parsnip) {
+          # Use parsnip workflow - preprocessing handled per fold during resampling
           dist_val <- "weibull"
           if (!is.null(engine_args$dist)) {
             dist_val <- engine_args$dist
@@ -1481,11 +1927,37 @@ train_models <- function(train_data,
             parsnip::set_mode("censored regression")
           spec <- do.call(parsnip::set_engine, c(list(survreg_spec, engine = engine), engine_args))
           spec_is_parsnip <- TRUE
+        } else {
+          # Native fit - no resampling, so prepping on full data is valid
+          prep_dat <- get_prepped_data()
+          baked_train <- prep_dat$data
+          rec_prep <- prep_dat$recipe
+          fit <- call_with_engine_params(
+            survival::survreg,
+            list(
+              formula = as.formula(paste(response_col, "~ .")),
+              data = baked_train,
+              dist = "weibull"
+            ),
+            engine_args
+          )
+          spec <- create_native_spec("survreg", engine, fit, rec_prep,
+                                     extras = list(distribution = "weibull"))
         }
       } else if (algo == "parametric_surv") {
         if (!requireNamespace("flexsurv", quietly = TRUE)) {
           warning("Package 'flexsurv' not installed; skipping parametric_surv.")
           next
+        }
+        apply_seed_defaults()
+        # Native-only model: warn if resampling was requested
+        if (prefer_parsnip) {
+          warning(
+            "Parametric survival (flexsurv) does not have a tidymodels interface. ",
+            "Preprocessing will be applied to full training data. ",
+            "Cross-validation metrics will not be available for this model.",
+            call. = FALSE
+          )
         }
         prep_dat <- get_prepped_data()
         baked_train <- prep_dat$data
@@ -1548,6 +2020,16 @@ train_models <- function(train_data,
         if (!requireNamespace("flexsurv", quietly = TRUE)) {
           warning("Package 'flexsurv' not installed; skipping piecewise_exp.")
           next
+        }
+        apply_seed_defaults()
+        # Native-only model: warn if resampling was requested
+        if (prefer_parsnip) {
+          warning(
+            "Piecewise exponential (flexsurv) does not have a tidymodels interface. ",
+            "Preprocessing will be applied to full training data. ",
+            "Cross-validation metrics will not be available for this model.",
+            call. = FALSE
+          )
         }
 
         prep_dat <- get_prepped_data()
@@ -1642,6 +2124,16 @@ train_models <- function(train_data,
           warning("Package 'rstpm2' not installed; skipping royston_parmar.")
           next
         }
+        apply_seed_defaults()
+        # Native-only model: warn if resampling was requested
+        if (prefer_parsnip) {
+          warning(
+            "Royston-Parmar (rstpm2) does not have a tidymodels interface. ",
+            "Preprocessing will be applied to full training data. ",
+            "Cross-validation metrics will not be available for this model.",
+            call. = FALSE
+          )
+        }
         prep_dat <- get_prepped_data()
         baked_train <- as.data.frame(prep_dat$data)
         rec_prep <- prep_dat$recipe
@@ -1687,6 +2179,11 @@ train_models <- function(train_data,
           fit_obj
         }, error = function(e) e)
         if (inherits(fit, "error")) {
+          failed_models[[length(failed_models) + 1]] <- list(
+            algorithm = algo,
+            engine = engine,
+            reason = fit$message
+          )
           warning(sprintf("royston_parmar training failed: %s", fit$message))
           next
         }
@@ -1792,9 +2289,9 @@ train_models <- function(train_data,
           }
           if (nrow(param_set) > 0) {
             if (tuning_strategy == "grid" && !adaptive) {
-              tune_grid_values <- grid_regular(param_set, levels = 3)
+              tune_grid_values <- grid_regular(param_set, levels = grid_levels)
             } else {
-              tune_grid_values <- grid_regular(param_set, levels = 3)
+              tune_grid_values <- grid_regular(param_set, levels = grid_levels)
             }
           } else {
             perform_tuning <- FALSE
@@ -1813,7 +2310,7 @@ train_models <- function(train_data,
         lower_is_better <- if (!is.na(metric_direction) && !is.null(metric_direction)) {
           identical(metric_direction, "minimize")
         } else {
-          metric %in% c("rmse", "mae", "ibs", "logloss", "mse", "brier_score") ||
+          metric %in% c("rmse", "mae", "ibs", "logloss", "mse", "brier_score", "ece") ||
             grepl("brier", metric, fixed = TRUE)
         }
 
@@ -1831,12 +2328,23 @@ train_models <- function(train_data,
               label = label,
               metric = metric,
               event_class = event_class,
+              class_threshold = class_threshold,
               engine = engine,
               start_col = start_col,
               time_col = time_col,
               status_col = status_col,
               eval_times = eval_times,
-              at_risk_threshold = at_risk_threshold
+              at_risk_threshold = at_risk_threshold,
+              survival_metric_convention = survival_metric_convention,
+              engine_args = fit_engine_args,
+              seed = seed,
+              summaryFunction = summaryFunction,
+              multiclass_auc = multiclass_auc
+            )
+            res_summary <- fastml_attach_fold_sizes(
+              res_summary,
+              if (!is.null(resample_plan)) resample_plan else resamples,
+              task
             )
             if (is.null(res_summary) || is.null(res_summary$aggregated)) {
               next
@@ -1874,12 +2382,24 @@ train_models <- function(train_data,
             label = label,
             metric = metric,
             event_class = event_class,
+            class_threshold = class_threshold,
             engine = engine,
             start_col = start_col,
             time_col = time_col,
             status_col = status_col,
             eval_times = eval_times,
-            at_risk_threshold = at_risk_threshold
+            at_risk_threshold = at_risk_threshold,
+            survival_metric_convention = survival_metric_convention,
+            engine_args = fit_engine_args,
+            seed = seed,
+            summaryFunction = summaryFunction,
+            multiclass_auc = multiclass_auc,
+            store_fold_models = store_fold_models
+          )
+          res_summary_best <- fastml_attach_fold_sizes(
+            res_summary_best,
+            if (!is.null(resample_plan)) resample_plan else resamples,
+            task
           )
         }
 
@@ -1893,10 +2413,12 @@ train_models <- function(train_data,
           wf <- finalize_workflow(wf, tune_grid_values[1, , drop = FALSE])
         }
 
-        models[[algo]] <- do.call(
-          parsnip::fit,
-          c(list(object = wf, data = train_data), fit_engine_args)
-        )
+        models[[algo]] <- fastml_with_seed(seed, function() {
+          do.call(
+            parsnip::fit,
+            c(list(object = wf, data = train_data), fit_engine_args)
+          )
+        })
       }
     }
 
@@ -1908,18 +2430,34 @@ train_models <- function(train_data,
       attr(models, "resampling_plan") <- resample_plan
     }
 
+    # Report failed models prominently
+    if (length(failed_models) > 0) {
+      message("\n", paste(rep("=", 60), collapse = ""))
+      message(sprintf("WARNING: %d model(s) failed to train:", length(failed_models)))
+      message(paste(rep("-", 60), collapse = ""))
+      for (fm in failed_models) {
+        message(sprintf("  - %s (%s): %s", fm$algorithm, fm$engine, fm$reason))
+      }
+      message(paste(rep("=", 60), collapse = ""), "\n")
+      attr(models, "failed_models") <- failed_models
+    }
+
+    fastml_emit_determinism_warnings(determinism_warnings)
+
     return(models)
   } else if (task == "classification") {
-
     if(is.null(summaryFunction)){
       metrics <- metric_set(
-        accuracy,
-        kap,
-        sens,
-        spec,
-        precision,
-        f_meas,
-        roc_auc
+        accuracy_metric,
+        kap_metric,
+        sens_metric,
+        spec_metric,
+        precision_metric,
+        f_meas_metric,
+        roc_auc,
+        logloss = logloss_metric,
+        brier_score = brier_metric,
+        ece = ece_metric
       )
     }else{
 
@@ -1928,13 +2466,16 @@ train_models <- function(train_data,
       assign(metric, newClassMetric)
 
       metrics <- metric_set(
-        accuracy,
-        kap,
-        sens,
-        spec,
-        precision,
-        f_meas,
+        accuracy_metric,
+        kap_metric,
+        sens_metric,
+        spec_metric,
+        precision_metric,
+        f_meas_metric,
         roc_auc,
+        logloss = logloss_metric,
+        brier_score = brier_metric,
+        ece = ece_metric,
         !!sym(metric)
       )
 
@@ -1946,7 +2487,7 @@ train_models <- function(train_data,
 
   # Ensure the requested metric is available in the current metric set
   metric_ids <- if (task == "classification") {
-    base_ids <- c("accuracy", "kap", "sens", "spec", "precision", "f_meas", "roc_auc")
+    base_ids <- c("accuracy", "kap", "sens", "spec", "precision", "f_meas", "roc_auc", "logloss", "brier_score", "ece")
     if (!is.null(summaryFunction)) {
       base_ids <- c(base_ids, metric)
     }
@@ -1982,13 +2523,24 @@ train_models <- function(train_data,
       stop("'resamples' must be an 'rset' object or a fastml resampling plan")
     }
   } else if (resampling_method == "cv") {
-    if (nrow(resample_data) < folds) {
+    n_data <- nrow(resample_data)
+    if (n_data < 3) {
       stop(
         sprintf(
-          "You requested %d-fold cross-validation, but your training set only has %d rows. \nThis prevents each fold from having at least one row. \nEither reduce 'folds', increase data, or use a different resampling method (e.g. 'boot').",
-          folds,
-          nrow(resample_data)
+          "Cross-validation requires at least 3 rows, but your training set only has %d rows. \nUse a different resampling method (e.g. 'boot') or provide more data.",
+          n_data
         )
+      )
+    }
+    if (folds >= n_data) {
+      old_folds <- folds
+      folds <- max(2L, n_data - 1L)
+      warning(
+        sprintf(
+          "Reducing folds from %d to %d because the training set has only %d rows (folds >= n would trigger leave-one-out CV, which is not supported by vfold_cv).",
+          old_folds, folds, n_data
+        ),
+        call. = FALSE
       )
     }
     resamples_obj <- vfold_cv(
@@ -2018,13 +2570,24 @@ train_models <- function(train_data,
       params = list(times = folds, strata = if (task == "classification") label else NULL)
     )
   } else if (resampling_method == "repeatedcv") {
-
-    if (nrow(resample_data) < folds) {
+    n_data <- nrow(resample_data)
+    if (n_data < 3) {
       stop(
         sprintf(
-          "You requested %d-fold cross-validation, but your training set only has %d rows. \nThis prevents each fold from having at least one row. \nEither reduce 'folds', increase data, or use a different resampling method (e.g. 'boot').",
-          folds, nrow(resample_data)
+          "Cross-validation requires at least 3 rows, but your training set only has %d rows. \nUse a different resampling method (e.g. 'boot') or provide more data.",
+          n_data
         )
+      )
+    }
+    if (folds >= n_data) {
+      old_folds <- folds
+      folds <- max(2L, n_data - 1L)
+      warning(
+        sprintf(
+          "Reducing folds from %d to %d because the training set has only %d rows (folds >= n would trigger leave-one-out CV, which is not supported by vfold_cv).",
+          old_folds, folds, n_data
+        ),
+        call. = FALSE
       )
     }
     repeats_val <- if (is.null(repeats)) 1L else repeats
@@ -2169,6 +2732,7 @@ train_models <- function(train_data,
   }
 
   models <- list()
+  failed_models <- list()
   resampling_summaries <- list()
   resample_method_meta <- if (!is.null(resample_plan)) {
     fastml_resample_method(resample_plan) %||% resampling_method
@@ -2180,12 +2744,38 @@ train_models <- function(train_data,
   nested_details <- list()
 
   # A helper function to choose the engine for an algorithm
-  get_engine <- function(algo, default_engine) {
+  get_engine <- function(algo, fastml_default_engine) {
+    # If user explicitly specified engine, use it without warning
     if (!is.null(algorithm_engines) && !is.null(algorithm_engines[[algo]])) {
+      if (verbose) {
+        message(sprintf("[%s] Using user-specified engine: '%s'", algo, algorithm_engines[[algo]]))
+      }
       return(algorithm_engines[[algo]])
-    } else {
-      return(default_engine)
     }
+
+    # Determine which default to use
+    if (use_parsnip_defaults) {
+      parsnip_default <- get_parsnip_default_engine(algo, task)
+      if (!is.null(parsnip_default)) {
+        if (verbose) {
+          message(sprintf("[%s] Using parsnip default engine: '%s'", algo, parsnip_default))
+        }
+        return(parsnip_default)
+      }
+      # Fall back to fastml default if no parsnip default exists
+      if (verbose) {
+        message(sprintf("[%s] No parsnip default found, using fastml default: '%s'", algo, fastml_default_engine))
+      }
+      return(fastml_default_engine)
+    }
+
+    # Using fastml default - warn if it differs from parsnip
+    if (warn_engine_defaults) {
+      warn_default_override(algo, task, fastml_default_engine, verbose = verbose)
+    } else if (verbose) {
+      message(sprintf("[%s] Using fastml default engine: '%s'", algo, fastml_default_engine))
+    }
+    return(fastml_default_engine)
   }
 
   update_params <- function(params_model, new_params) {
@@ -2245,7 +2835,85 @@ train_models <- function(train_data,
     return(params_model)
   }
 
+  predictors_all_numeric <- function(df) {
+    if (is.null(df) || ncol(df) == 0) {
+      return(TRUE)
+    }
+    is_numeric <- function(col) is.numeric(col) || is.integer(col) || is.logical(col)
+    all(vapply(df, is_numeric, logical(1)))
+  }
+
+  # NOTE: baked_predictors cache is used ONLY for tuning parameter finalization
+
+  # (e.g., determining mtry range based on post-preprocessing column count).
+  # This is a known limitation of dials::finalize() which needs the predictor
+  # structure before model training. The actual model training uses workflows
+  # which handle per-fold preprocessing correctly during resampling.
+  baked_predictors <- NULL
+  baked_predictors_ready <- FALSE
+
+  get_baked_predictors <- function() {
+    if (baked_predictors_ready) {
+      return(baked_predictors)
+    }
+    baked_predictors_ready <<- TRUE
+    if (is.null(recipe)) {
+      baked_predictors <<- NULL
+      return(NULL)
+    }
+    baked <- tryCatch(
+      recipes::bake(recipe, new_data = train_data),
+      error = function(e) NULL
+    )
+    if (is.null(baked)) {
+      baked <- tryCatch({
+        prepped <- recipes::prep(recipe, training = train_data, retain = TRUE)
+        recipes::bake(prepped, new_data = NULL)
+      }, error = function(e) NULL)
+    }
+    if (!is.null(baked) && !is.null(label) && label %in% names(baked)) {
+      baked <- baked[, setdiff(names(baked), label), drop = FALSE]
+    }
+    baked_predictors <<- baked
+    baked
+  }
+
+  finalize_predictors <- function(raw_predictors) {
+    if (predictors_all_numeric(raw_predictors)) {
+      return(raw_predictors)
+    }
+    baked <- get_baked_predictors()
+    if (!is.null(baked) && predictors_all_numeric(baked)) {
+      return(baked)
+    }
+    mm <- tryCatch(
+      stats::model.matrix(~ . - 1, data = raw_predictors),
+      error = function(e) NULL
+    )
+    if (!is.null(mm)) {
+      return(as.data.frame(mm))
+    }
+    raw_predictors
+  }
+
   n_class <- length(levels(train_data[[label]]))
+
+  # Validate that there are at least 2 classes for classification
+  if (n_class < 2) {
+    # Check actual unique values in case factor levels are misleading
+    actual_classes <- length(unique(na.omit(train_data[[label]])))
+    if (actual_classes < 2) {
+      stop(
+        sprintf(
+          "Classification requires at least 2 classes, but the outcome '%s' has only %d unique value(s). ",
+          label, actual_classes
+        ),
+        "Check your data for class imbalance or filtering issues.",
+        call. = FALSE
+      )
+    }
+  }
+
   if (n_class == 2 && "multinom_reg" %in% algorithms) {
     warning(
       sprintf(
@@ -2258,7 +2926,8 @@ train_models <- function(train_data,
     algorithms <- algorithms[!duplicated(algorithms)]
   }
 
-  for (algo in algorithms) {
+  for (algo_index in seq_along(algorithms)) {
+    algo <- algorithms[[algo_index]]
     set.seed(seed)
 
     # Assume that get_engine() now may return multiple engine names.
@@ -2272,8 +2941,12 @@ train_models <- function(train_data,
     models[[algo]] <- list()
 
     # Loop over each engine provided
-    for (engine in engines) {
+    for (engine_index in seq_along(engines)) {
+      engine <- engines[[engine_index]]
+      tuning_seed_base <- fastml_tuning_seed(seed, offset = algo_index * 100L + engine_index)
       engine_args <- resolve_engine_params(engine_params, algo, engine)
+      engine_args <- fastml_apply_engine_seed(engine_args, algo, engine, seed, n_cores_val, task)
+      add_determinism_warning(algo, engine, engine_args)
 
       # Get default parameters for this engine
       if (use_default_tuning) {
@@ -2354,9 +3027,10 @@ train_models <- function(train_data,
         if (nested_mode) {
           tune_params_template <- param_set
         } else {
+          raw_predictors <- train_data %>% dplyr::select(-dplyr::all_of(label))
           tune_params_model <- finalize(
             param_set,
-            x = train_data %>% dplyr::select(-dplyr::all_of(label))
+            x = finalize_predictors(raw_predictors)
           )
 
           if (!is.null(engine_tune_params)) {
@@ -2364,45 +3038,30 @@ train_models <- function(train_data,
           }
 
           if (nrow(tune_params_model) > 0 && tuning_strategy == "grid" && !adaptive) {
-            tune_grid_values <- grid_regular(tune_params_model, levels = 3)
+            tune_grid_values <- grid_regular(tune_params_model, levels = grid_levels)
           }
         }
       }
 
       do_tuning <- perform_tuning && !all(vapply(engine_tune_params, is.null, logical(1)))
 
+      # Apply engine_args to model_spec via set_engine before creating workflow
+      model_spec_base <- if (inherits(model_spec, "model_spec")) model_spec else model_spec[[1]]
+      if (length(engine_args) > 0) {
+        model_spec_base <- do.call(
+          parsnip::set_engine,
+          c(list(model_spec_base, engine = engine), engine_args)
+        )
+      }
+
       # Create the workflow
       workflow_spec <- workflow() %>%
-        add_model(if(inherits(model_spec,"model_spec")) model_spec else model_spec[[1]]) %>%
+        add_model(model_spec_base) %>%
         add_recipe(recipe)
-
-      if (!perform_tuning && !nested_mode && !is.null(resamples)) {
-        res_summary <- fastml_guarded_resample_fit(
-          workflow_spec = workflow_spec,
-          resamples = if (!is.null(resample_plan)) resample_plan else resamples,
-          original_train_rows = nrow(train_data),
-          task = task,
-          label = label,
-          metric = metric,
-          event_class = event_class,
-          engine = engine,
-          start_col = start_col,
-          time_col = time_col,
-          status_col = status_col,
-          eval_times = eval_times,
-          at_risk_threshold = at_risk_threshold
-        )
-        if (!is.null(res_summary)) {
-          if (is.null(resampling_summaries[[algo]])) {
-            resampling_summaries[[algo]] <- list()
-          }
-          resampling_summaries[[algo]][[engine]] <- res_summary
-        }
-      }
 
       # Fit the model (with tuning if requested)
       tryCatch({
-        allow_par <- TRUE
+        allow_par <- allow_par_base
         my_metrics <- NULL
 
         if (do_tuning) {
@@ -2414,7 +3073,7 @@ train_models <- function(train_data,
                 rename_with(~ sub("^\\.pred_p", ".pred_", .x), starts_with(".pred_p"))
 
               # Call the built-in roc_auc() with the renamed columns
-              yardstick::roc_auc(data, truth = {{truth}}, ...)
+                roc_auc(data, truth = {{truth}}, ...)
             }
 
             # Assign the same metadata as roc_auc() so metric ids stay consistent
@@ -2422,28 +3081,47 @@ train_models <- function(train_data,
             attr(roc_auc_h2o, "direction") <- attr(yardstick::roc_auc, "direction")
             attr(roc_auc_h2o, "metric_name") <- attr(yardstick::roc_auc, "metric_name")
 
-            my_metrics <- metric_set(accuracy, kap, sens, spec, precision, f_meas, roc_auc_h2o)
+            my_metrics <- metric_set(
+              accuracy_metric,
+              kap_metric,
+              sens_metric,
+              spec_metric,
+              precision_metric,
+              f_meas_metric,
+              roc_auc = roc_auc_h2o,
+              logloss = logloss_metric,
+              brier_score = brier_metric,
+              ece = ece_metric
+            )
 
-            allow_par = FALSE
+            allow_par <- FALSE
           }
 
           else if(engine == "LiblineaR"){
 
-            my_metrics <- metric_set(accuracy, kap, sens, spec, precision, f_meas)
-            allow_par = TRUE
+            my_metrics <- metric_set(accuracy_metric, kap_metric, sens_metric, spec_metric, precision_metric, f_meas_metric)
+            allow_par <- allow_par_base
 
           }else{
-            allow_par = TRUE
-            my_metrics = NULL
+            allow_par <- allow_par_base
+            my_metrics <- NULL
           }
         }
 
         ctrl_grid <- control_grid(save_pred = TRUE, allow_par = allow_par)
-        ctrl_bayes <- control_bayes(save_pred = TRUE)
+        ctrl_bayes <- if (!is.null(tuning_seed_base)) {
+          control_bayes(save_pred = TRUE, seed = tuning_seed_base)
+        } else {
+          control_bayes(save_pred = TRUE)
+        }
         ctrl_race <- control_race(save_pred = TRUE)
 
         if (early_stopping && tuning_strategy == "bayes") {
-          ctrl_bayes <- control_bayes(save_pred = TRUE, no_improve = 5)
+          ctrl_bayes <- if (!is.null(tuning_seed_base)) {
+            control_bayes(save_pred = TRUE, no_improve = 5, seed = tuning_seed_base)
+          } else {
+            control_bayes(save_pred = TRUE, no_improve = 5)
+          }
         }
 
         if (nested_mode) {
@@ -2469,13 +3147,16 @@ train_models <- function(train_data,
             my_metrics = my_metrics,
             do_tuning = do_tuning,
             event_class = event_class,
+            class_threshold = class_threshold,
             start_col = start_col,
             time_col = time_col,
             status_col = status_col,
             eval_times = eval_times,
             at_risk_threshold = at_risk_threshold,
-            seed = seed,
-            update_params_fn = update_params
+            seed = tuning_seed_base,
+            update_params_fn = update_params,
+            multiclass_auc = multiclass_auc,
+            grid_levels = grid_levels
           )
 
           model <- nested_fit$final_model
@@ -2494,79 +3175,239 @@ train_models <- function(train_data,
 
           # Select tuning function based on strategy
           if (tuning_strategy == "bayes") {
-            model_tuned <- do.call(
-              tune_bayes,
-              c(list(
+            model_tuned <- fastml_with_seed(tuning_seed_base, function() {
+              tune_bayes(
                 object = workflow_spec,
                 resamples = resamples,
                 param_info = tune_params_model,
                 iter = tuning_iterations,
                 metrics = if(!is.null(my_metrics)) my_metrics else metrics,
                 control = ctrl_bayes
-              ), engine_args)
-            )
+              )
+            })
           } else if (adaptive) {
-            model_tuned <- do.call(
-              tune_race_anova,
-              c(list(
+            model_tuned <- fastml_with_seed(tuning_seed_base, function() {
+              tune_race_anova(
                 object = workflow_spec,
                 resamples = resamples,
                 param_info = tune_params_model,
                 grid = if (is.null(tune_grid_values)) 20 else tune_grid_values,
                 metrics = if(!is.null(my_metrics)) my_metrics else metrics,
                 control = ctrl_race
-              ), engine_args)
-            )
+              )
+            })
           } else if (tuning_strategy == "grid") {
             if (is.null(tune_grid_values)) {
-              tune_grid_values <- grid_regular(tune_params_model, levels = 3)
+              tune_grid_values <- grid_regular(tune_params_model, levels = grid_levels)
             }
-            model_tuned <- do.call(
-              tune::tune_grid,
-              c(list(
+            model_tuned <- fastml_with_seed(tuning_seed_base, function() {
+              tune::tune_grid(
                 object = workflow_spec,
                 resamples = resamples,
                 grid = tune_grid_values,
                 metrics = if(!is.null(my_metrics)) my_metrics else metrics,
                 control = ctrl_grid
-              ), engine_args)
-            )
+              )
+            })
           } else {
-            model_tuned <- do.call(
-              tune::tune_grid,
-              c(list(
+            model_tuned <- fastml_with_seed(tuning_seed_base, function() {
+              tune::tune_grid(
                 object = workflow_spec,
                 resamples = resamples,
                 grid = if (is.null(tune_grid_values)) 5 else tune_grid_values,
                 metrics = if(!is.null(my_metrics)) my_metrics else metrics,
                 control = ctrl_grid
-              ), engine_args)
-            )
+              )
+            })
           }
 
-          best_params <- select_best(model_tuned, metric = metric)
-          final_workflow <- finalize_workflow(workflow_spec, best_params)
-          model <- do.call(
-            parsnip::fit,
-            c(list(object = final_workflow, data = train_data), engine_args)
+          best_metric_used <- metric
+          best_params <- tryCatch(
+            select_best(model_tuned, metric = metric),
+            error = function(e) NULL
           )
-        } else {
-          # Rebuild the workflow with engine parameters applied correctly
-          if (length(engine_args) > 0) {
-            model_spec_with_engine <- do.call(
-              parsnip::set_engine,
-              c(list(model_spec, engine = engine), engine_args)
+          if (is.null(best_params) || !is.data.frame(best_params) || nrow(best_params) == 0) {
+            metrics_tbl <- tryCatch(
+              tune::collect_metrics(model_tuned),
+              error = function(e) NULL
             )
-            workflow_spec <- workflows::workflow() %>%
-              workflows::add_model(model_spec_with_engine) %>%
-              workflows::add_recipe(recipe)
+            if (!is.null(metrics_tbl) && ".metric" %in% names(metrics_tbl)) {
+              candidate_metrics <- unique(metrics_tbl$.metric)
+              candidate_metrics <- setdiff(candidate_metrics, metric)
+              for (cand in candidate_metrics) {
+                cand_best <- tryCatch(
+                  select_best(model_tuned, metric = cand),
+                  error = function(e) NULL
+                )
+                if (!is.null(cand_best) && nrow(cand_best) > 0) {
+                  best_params <- cand_best
+                  best_metric_used <- cand
+                  break
+                }
+              }
+            }
           }
 
-          model <- parsnip::fit(workflow_spec, data = train_data)
+          if (!identical(best_metric_used, metric)) {
+            warning(
+              sprintf(
+                "Metric '%s' unavailable during tuning for %s (%s); selecting parameters using '%s'.",
+                metric, algo, engine, best_metric_used
+              ),
+              call. = FALSE
+            )
+          }
+
+          fallback_workflow <- NULL
+          if (is.null(best_params) || !is.data.frame(best_params) || nrow(best_params) == 0) {
+            fallback_grid <- tune_grid_values
+            if (is.null(fallback_grid) || nrow(fallback_grid) == 0) {
+              fallback_grid <- tryCatch(
+                grid_regular(tune_params_model, levels = grid_levels),
+                error = function(e) NULL
+              )
+            }
+            if (!is.null(fallback_grid) && nrow(fallback_grid) > 0) {
+              best_params <- fallback_grid[1, , drop = FALSE]
+              warning(
+                sprintf(
+                  "Tuning failed to select parameters for %s (%s); using the first available grid configuration.",
+                  algo, engine
+                ),
+                call. = FALSE
+              )
+            } else {
+              warning(
+                sprintf(
+                  "Tuning failed to select parameters for %s (%s); refitting with default settings.",
+                  algo, engine
+                ),
+                call. = FALSE
+              )
+              fallback_context <- spec_context
+              fallback_context$tuning <- FALSE
+              fallback_info <- fastml_get_model_spec(algo, fallback_context)
+              fallback_spec <- if (!is.null(fallback_info)) fallback_info$model_spec else NULL
+              if (!is.null(fallback_spec)) {
+                fallback_spec_base <- if (inherits(fallback_spec, "model_spec")) {
+                  fallback_spec
+                } else {
+                  fallback_spec[[1]]
+                }
+                if (length(engine_args) > 0) {
+                  fallback_spec_base <- do.call(
+                    parsnip::set_engine,
+                    c(list(fallback_spec_base, engine = engine), engine_args)
+                  )
+                }
+                fallback_workflow <- workflow() %>%
+                  add_model(fallback_spec_base) %>%
+                  add_recipe(recipe)
+              }
+            }
+          }
+
+          if (!is.null(best_params) && is.data.frame(best_params) && nrow(best_params) > 0) {
+            final_workflow <- finalize_workflow(workflow_spec, best_params)
+          } else if (!is.null(fallback_workflow)) {
+            final_workflow <- fallback_workflow
+          } else {
+            stop(
+              sprintf(
+                "Tuning failed for %s (%s) and no fallback configuration is available.",
+                algo, engine
+              )
+            )
+          }
+          if (!nested_mode && !is.null(resamples)) {
+            res_summary <- fastml_guarded_resample_fit(
+              workflow_spec = final_workflow,
+              resamples = if (!is.null(resample_plan)) resample_plan else resamples,
+              original_train_rows = nrow(train_data),
+              task = task,
+              label = label,
+              metric = metric,
+              event_class = event_class,
+              class_threshold = class_threshold,
+              engine = engine,
+              start_col = start_col,
+              time_col = time_col,
+              status_col = status_col,
+              eval_times = eval_times,
+              at_risk_threshold = at_risk_threshold,
+              survival_metric_convention = survival_metric_convention,
+              engine_args = list(),  # engine_args already embedded in workflow via set_engine()
+              seed = tuning_seed_base,
+              summaryFunction = summaryFunction,
+              multiclass_auc = multiclass_auc,
+              store_fold_models = store_fold_models
+            )
+            res_summary <- fastml_attach_fold_sizes(
+              res_summary,
+              if (!is.null(resample_plan)) resample_plan else resamples,
+              task
+            )
+            if (!is.null(res_summary)) {
+              if (is.null(resampling_summaries[[algo]])) {
+                resampling_summaries[[algo]] <- list()
+              }
+              resampling_summaries[[algo]][[engine]] <- res_summary
+            }
+          }
+          model <- fastml_with_seed(tuning_seed_base, function() {
+            parsnip::fit(final_workflow, data = train_data)
+          })
+        } else {
+          # Use the workflow with engine parameters already applied
+          final_workflow <- workflow_spec
+
+          if (!nested_mode && !is.null(resamples)) {
+            res_summary <- fastml_guarded_resample_fit(
+              workflow_spec = final_workflow,
+              resamples = if (!is.null(resample_plan)) resample_plan else resamples,
+              original_train_rows = nrow(train_data),
+            task = task,
+            label = label,
+            metric = metric,
+            event_class = event_class,
+            class_threshold = class_threshold,
+            engine = engine,
+              start_col = start_col,
+              time_col = time_col,
+              status_col = status_col,
+              eval_times = eval_times,
+              at_risk_threshold = at_risk_threshold,
+              survival_metric_convention = survival_metric_convention,
+              seed = tuning_seed_base,
+              summaryFunction = summaryFunction,
+              multiclass_auc = multiclass_auc,
+              store_fold_models = store_fold_models
+            )
+            res_summary <- fastml_attach_fold_sizes(
+              res_summary,
+              if (!is.null(resample_plan)) resample_plan else resamples,
+              task
+            )
+            if (!is.null(res_summary)) {
+              if (is.null(resampling_summaries[[algo]])) {
+                resampling_summaries[[algo]] <- list()
+              }
+              resampling_summaries[[algo]][[engine]] <- res_summary
+            }
+          }
+
+          model <- fastml_with_seed(tuning_seed_base, function() {
+            parsnip::fit(final_workflow, data = train_data)
+          })
         }
         # Save the fitted model in the nested list under the current engine
         models[[algo]][[engine]] <- model
       }, error = function(e) {
+        failed_models[[length(failed_models) + 1]] <<- list(
+          algorithm = algo,
+          engine = engine,
+          reason = e$message
+        )
         warning(paste("Training failed for algorithm:", algo, "with engine:", engine,
                       "\nError message:", e$message))
       })
@@ -2595,6 +3436,20 @@ train_models <- function(train_data,
   if (!is.null(resample_plan)) {
     attr(models, "resampling_plan") <- resample_plan
   }
+
+  # Report failed models prominently
+  if (length(failed_models) > 0) {
+    message("\n", paste(rep("=", 60), collapse = ""))
+    message(sprintf("WARNING: %d model(s) failed to train:", length(failed_models)))
+    message(paste(rep("-", 60), collapse = ""))
+    for (fm in failed_models) {
+      message(sprintf("  - %s (%s): %s", fm$algorithm, fm$engine, fm$reason))
+    }
+    message(paste(rep("=", 60), collapse = ""), "\n")
+    attr(models, "failed_models") <- failed_models
+  }
+
+  fastml_emit_determinism_warnings(determinism_warnings)
 
   return(models)
 }

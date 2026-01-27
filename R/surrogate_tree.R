@@ -7,6 +7,7 @@
 #' @param maxdepth Maximum depth of the surrogate tree. Default 3.
 #' @param ... Additional arguments passed to `iml::TreeSurrogate`.
 #'
+#' @param data Character string specifying which data to use: \code{"train"} (default) or \code{"test"}.
 #' @return An `iml::TreeSurrogate` object.
 #' @importFrom iml Predictor TreeSurrogate
 #' @importFrom recipes bake
@@ -19,7 +20,7 @@
 #' model <- fastml(data = iris, label = "Species")
 #' surrogate_tree(model)
 #' }
-surrogate_tree <- function(object, maxdepth = 3, ...) {
+surrogate_tree <- function(object, maxdepth = 3, data = c("train", "test"), ...) {
   if (!inherits(object, "fastml")) {
     stop("The input must be a 'fastml' object.")
   }
@@ -27,7 +28,8 @@ surrogate_tree <- function(object, maxdepth = 3, ...) {
     stop("The 'iml' package is required for surrogate models.")
   }
 
-  prep <- fastml_prepare_explainer_inputs(object)
+  data <- match.arg(data)
+  prep <- fastml_prepare_explainer_inputs(object, data = data)
   raw_data <- prep$train_data
   if (is.null(raw_data) || !(prep$label %in% names(raw_data))) {
     stop("Training data not available for surrogate models.")
@@ -35,19 +37,34 @@ surrogate_tree <- function(object, maxdepth = 3, ...) {
   x <- prep$x_raw
   y <- prep$y_raw
 
-  # Convert factor/character targets to numeric (0/1) for iml
-  positive_class <- prep$positive_class
+  # Handle classification targets for iml
+  # Determine if this is multiclass (>2 classes)
+  is_multiclass <- FALSE
+  positive_class <- NULL
   if (is.factor(y) || is.character(y)) {
     y_factor <- if (is.factor(y)) y else factor(y)
-    if (is.null(positive_class) || !(positive_class %in% levels(y_factor))) {
-      positive_class <- levels(y_factor)[1]
+    n_classes <- length(levels(y_factor))
+    is_multiclass <- n_classes > 2
+
+    if (is_multiclass) {
+      # Multiclass: keep y as factor, iml will handle it properly
+      # when predict function returns all class probabilities
+      y <- y_factor
+    } else {
+      # Binary classification: convert to numeric (0/1) for iml
+      # Use resolve_positive_class to respect event_class settings from fastml()
+      positive_class <- resolve_positive_class(prep, levels(y_factor))
+      y <- as.numeric(y_factor == positive_class)
     }
-    y <- as.numeric(y_factor == positive_class)
+  } else {
+    positive_class <- prep$positive_class
   }
 
   parsnip_fit <- prep$fits[[1]]
 
-  # Custom predict function returning numeric probabilities (or numeric predictions)
+  # Custom predict function
+  # For multiclass: returns data.frame with all class probabilities
+  # For binary: returns numeric probability vector for the positive class
   predict_fun <- function(model, newdata) {
     newdata_processed <- tryCatch(
       {
@@ -65,6 +82,13 @@ surrogate_tree <- function(object, maxdepth = 3, ...) {
       error = function(e) NULL
     )
     if (!is.null(prob)) {
+      # Multiclass: return full probability data.frame (iml handles this)
+      if (is_multiclass) {
+        # Clean column names: remove .pred_ prefix
+        colnames(prob) <- sub("^\\.pred_", "", colnames(prob))
+        return(as.data.frame(prob))
+      }
+      # Binary: return probability for positive class
       prob_col <- paste0(".pred_", positive_class)
       if (!is.null(positive_class) && prob_col %in% names(prob)) {
         return(as.numeric(prob[[prob_col]]))

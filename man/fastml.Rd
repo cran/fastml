@@ -28,7 +28,10 @@ fastml(
   tune_params = NULL,
   engine_params = list(),
   metric = NULL,
+  class_threshold = "auto",
   algorithm_engines = NULL,
+  use_parsnip_defaults = FALSE,
+  warn_engine_defaults = TRUE,
   n_cores = 1,
   stratify = TRUE,
   impute_method = "error",
@@ -40,17 +43,22 @@ fastml(
   use_default_tuning = FALSE,
   tuning_strategy = "grid",
   tuning_iterations = 10,
+  tuning_complexity = "balanced",
+  grid_levels = NULL,
   early_stopping = FALSE,
   adaptive = FALSE,
   learning_curve = FALSE,
   seed = 123,
   verbose = FALSE,
   eval_times = NULL,
+  survival_metric_convention = "fastml",
   bootstrap_ci = TRUE,
   bootstrap_samples = 500,
   bootstrap_seed = NULL,
   at_risk_threshold = 0.1,
-  audit_mode = FALSE
+  audit_mode = FALSE,
+  multiclass_auc = "macro",
+  store_fold_models = FALSE
 )
 }
 \arguments{
@@ -109,7 +117,11 @@ successive resamples when \code{resampling_method = "rolling_origin"}.}
 \item{outer_folds}{Positive integer giving the number of outer folds to use when
 \code{resampling_method = "nested_cv"} and no custom \code{resamples} object is supplied.}
 
-\item{event_class}{A single string. Either "first" or "second" to specify which level of truth to consider as the "event". Default is "first".}
+\item{event_class}{A single string. Either "first" or "second" to specify which
+level of the binary outcome factor to treat as the positive class (the "event").
+For binary classification, "first" treats the first factor level as the positive
+class, "second" treats the second level as positive. Use
+\code{levels(your_data$outcome)} to check level order before training. Default is "first".}
 
 \item{exclude}{A character vector specifying the names of the columns to be excluded from the training process.}
 
@@ -128,9 +140,28 @@ should apply whenever an engine is fitted (for example,
 These arguments are distinct from \code{tune_params}, which define ranges of
 hyperparameters to explore during tuning. Default is an empty list.}
 
-\item{metric}{The performance metric to optimize during training.}
+\item{metric}{The performance metric to optimize during training. For
+classification, options include \code{"accuracy"}, \code{"roc_auc"},
+\code{"logloss"}, \code{"brier_score"}, and \code{"ece"} (plus other class metrics).}
+
+\item{class_threshold}{For binary classification, controls how class probabilities
+are converted into hard class predictions during holdout evaluation. Numeric
+values in (0, 1) set a fixed threshold. The default \code{"auto"} tunes a
+threshold on the training data to maximize F1; use \code{"model"} to keep
+the model's default threshold.}
 
 \item{algorithm_engines}{A named list specifying the engine to use for each algorithm.}
+
+\item{use_parsnip_defaults}{Logical. If \code{TRUE}, fastml uses parsnip's default
+engines instead of fastml's optimized defaults. This provides compatibility with
+standard tidymodels behavior. If \code{FALSE} (default), fastml uses its own
+curated engine defaults which may differ from parsnip. When engines differ,
+a warning is issued unless \code{algorithm_engines} explicitly specifies the engine.
+Use \code{print_default_differences()} to see all differences.}
+
+\item{warn_engine_defaults}{Logical. If \code{TRUE} (default), warns when fastml's
+default engine differs from parsnip's default. Set to \code{FALSE} to suppress
+these warnings. Warnings are only shown once per algorithm per session.}
 
 \item{n_cores}{An integer specifying the number of CPU cores to use for parallel processing. Default is \code{1}.}
 
@@ -153,8 +184,9 @@ can be applied at prediction time. Default is \code{"error"}.}
 \item{scaling_methods}{Vector of scaling methods to apply. Default is \code{c("center", "scale")}.}
 
 \item{balance_method}{Method to handle class imbalance. One of \code{"none"},
-\code{"upsample"}, or \code{"downsample"}. Applied to the training set for
-classification tasks. Default is \code{"none"}.}
+\code{"upsample"}, or \code{"downsample"}. Applied inside the preprocessing
+recipe so each resampling split is balanced independently (requires the
+\code{themis} package when enabled). Default is \code{"none"}.}
 
 \item{resamples}{Optional rsample object providing custom resampling splits.
 If supplied, \code{resampling_method}, \code{folds}, and \code{repeats} are
@@ -179,13 +211,42 @@ they will be ignored with a warning.}
 \code{tuning_strategy} is not \code{"bayes"}. Validation of this argument only
 occurs for the Bayesian strategy. Default is \code{10}.}
 
+\item{tuning_complexity}{Character string specifying a tuning complexity preset
+that controls grid density and parameter range width. One of:
+\describe{
+  \item{\code{"quick"}}{Minimal tuning (2 levels/param, ~32 combinations for 5 params).
+    Best for: prototyping, debugging, time-constrained scenarios.}
+  \item{\code{"balanced"}}{Standard tuning (3 levels/param, ~243 combinations).
+    Best for: most production use cases. This is the default.}
+  \item{\code{"thorough"}}{Comprehensive tuning (5 levels/param, ~3,125 combinations).
+    Best for: final model selection, publications.}
+  \item{\code{"exhaustive"}}{Maximum coverage (7 levels/param, ~16,807 combinations).
+    Best for: research, competitions. Consider Bayesian tuning instead.}
+}
+See \code{\link{print_tuning_presets}} for detailed comparison.
+Ignored if \code{grid_levels} is explicitly set.}
+
+\item{grid_levels}{Integer specifying the number of levels per parameter for
+grid search. Higher values create denser grids but increase computation time
+exponentially (grid size = levels^n_params). Typical values:
+\itemize{
+  \item 2: Very fast, minimal coverage
+  \item 3: Balanced (default via \code{tuning_complexity = "balanced"})
+  \item 5: Thorough coverage
+  \item 7+: Exhaustive (consider Bayesian tuning instead)
+}
+If \code{NULL} (default), determined by \code{tuning_complexity}.}
+
 \item{early_stopping}{Logical indicating whether to use early stopping in Bayesian tuning methods (if supported). Default is \code{FALSE}.}
 
 \item{adaptive}{Logical indicating whether to use adaptive/racing methods for tuning. Default is \code{FALSE}.}
 
 \item{learning_curve}{Logical. If TRUE, generate learning curves (performance vs. training size).}
 
-\item{seed}{An integer value specifying the random seed for reproducibility.}
+\item{seed}{An integer value specifying the random seed for reproducibility.
+fastml also configures parallel backends for deterministic RNG streams when
+possible; some external engines (e.g., h2o, spark, keras) may still be
+nondeterministic and will emit a warning.}
 
 \item{verbose}{Logical; if TRUE, prints progress messages during the training
 and evaluation process.}
@@ -194,6 +255,13 @@ and evaluation process.}
 models. When \code{NULL}, defaults to the median and 75th percentile of the
 observed follow-up times (rounded to the dataset's time unit).}
 
+\item{survival_metric_convention}{Character string specifying which survival
+metric conventions to follow. `"fastml"` (default) uses fastml's internal
+defaults for evaluation horizons and t_max. `"tidymodels"` uses
+`eval_times` as the explicit evaluation grid and applies yardstick-style
+Brier/IBS normalization; when `eval_times` is `NULL`, time-dependent Brier
+metrics are omitted.}
+
 \item{bootstrap_ci}{Logical indicating whether bootstrap confidence intervals
 should be computed for performance metrics. Applies to all task types.}
 
@@ -201,7 +269,8 @@ should be computed for performance metrics. Applies to all task types.}
 use when \code{bootstrap_ci = TRUE}. Defaults to 500.}
 
 \item{bootstrap_seed}{Optional seed passed to the bootstrap procedure used to
-estimate confidence intervals.}
+estimate confidence intervals. When omitted, defaults to `seed` for
+reproducible intervals; set to `NULL` to allow random bootstrap draws.}
 
 \item{at_risk_threshold}{Numeric value between 0 and 1 used for survival
 metrics to determine the last follow-up time (\eqn{t_{max}}). The maximum
@@ -212,6 +281,16 @@ subjects remain at risk.}
 preprocessing hooks and records potentially unsafe behaviour (such as global
 environment access or file I/O) while flagging the run as potentially
 unsafe.}
+
+\item{multiclass_auc}{For multiclass ROC AUC, the averaging method to use:
+`"macro"` (default, tidymodels) or `"macro_weighted"`. Macro weights each
+class equally, while macro_weighted weights by class prevalence and can
+change model rankings on imbalanced data.}
+
+\item{store_fold_models}{Logical. If \code{TRUE}, stores the models trained
+on each cross-validation fold (memory intensive). This enables
+\code{\link{explain_stability}} to compute feature importance across folds
+and assess explanation stability. Default is \code{FALSE}.}
 }
 \value{
 An object of class \code{fastml} containing the best model, performance metrics, and other information.
@@ -225,7 +304,69 @@ Fast Machine Learning Function
 Trains and evaluates multiple classification or regression models. The function automatically
 detects the task based on the target variable type and can perform advanced hyperparameter tuning
 using various tuning strategies.
+
+
+Model selection is based exclusively on resampling metrics (cross-validation
+or nested CV). The holdout split is reserved for final performance
+estimation and is never used to choose the best model, mirroring
+\code{tidymodels::last_fit()} semantics.
+
+For multiclass ROC AUC, fastml defaults to macro averaging (tidymodels).
+Macro treats each class equally, while macro_weighted weights by class
+prevalence and can change model rankings on imbalanced data. Keep the same
+setting when comparing runs.
+
+## Tuning: Speed vs Robustness Trade-offs
+
+Hyperparameter tuning involves a fundamental trade-off between computational
+cost and the likelihood of finding optimal hyperparameters. fastml provides
+presets via \code{tuning_complexity} to make this trade-off explicit:
+
+\tabular{lllll}{
+  \strong{Level} \tab \strong{Grid Size*} \tab \strong{Time} \tab \strong{Quality} \tab \strong{Use Case} \cr
+  quick \tab ~32 \tab ~1x \tab Low \tab Prototyping, debugging \cr
+  balanced \tab ~243 \tab ~10x \tab Medium \tab Most production use \cr
+  thorough \tab ~3,125 \tab ~100x \tab High \tab Final models, papers \cr
+  exhaustive \tab ~16,807 \tab ~1000x \tab Very High \tab Research, competitions \cr
 }
+*Grid size shown for 5 tunable parameters (levels^5)
+
+**Recommendations:**
+\itemize{
+  \item Start with \code{tuning_complexity = "quick"} during development
+  \item Use \code{"balanced"} (default) for most production pipelines
+  \item Switch to \code{"thorough"} for final model selection
+  \item Consider \code{tuning_strategy = "bayes"} instead of exhaustive grid search
+  \item Enable \code{adaptive = TRUE} for early stopping of poor configurations
+}
+
+Use \code{\link{print_tuning_presets}} to see all presets and
+\code{\link{estimate_tuning_time}} to estimate runtime before starting.
+}
+\section{Factor Level Warning}{
+
+For binary classification, the interpretation of metrics like sensitivity, specificity,
+and ROC AUC depends on which factor level is treated as the "positive" class (the event
+of interest). The \code{event_class} parameter controls this:
+\itemize{
+  \item \code{"first"} (default): The first factor level is treated as positive
+  \item \code{"second"}: The second factor level is treated as positive
+}
+
+\strong{Important:} Recipe preprocessing steps like \code{step_other()} or
+\code{step_unknown()} can modify factor levels, potentially changing which level
+is "first" or "second". Always verify factor levels after preprocessing.
+
+To ensure consistent behavior, explicitly set factor levels before calling fastml:
+\preformatted{
+# Ensure "positive" is the second level (event_class = "second")
+data$outcome <- factor(data$outcome, levels = c("negative", "positive"))
+
+# Or ensure "positive" is the first level (event_class = "first")
+data$outcome <- factor(data$outcome, levels = c("positive", "negative"))
+}
+}
+
 \examples{
 \donttest{
 # Example 1: Using the iris dataset for binary classification (excluding 'setosa')

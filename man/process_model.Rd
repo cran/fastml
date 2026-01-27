@@ -11,6 +11,7 @@ process_model(
   test_data,
   label,
   event_class,
+  class_threshold = "auto",
   start_col = NULL,
   time_col = NULL,
   status_col = NULL,
@@ -22,9 +23,11 @@ process_model(
   bootstrap_samples = 500,
   bootstrap_seed = 1234,
   at_risk_threshold = 0.1,
+  survival_metric_convention = "fastml",
   metrics = NULL,
   summaryFunction = NULL,
-  precomputed_predictions = NULL
+  precomputed_predictions = NULL,
+  multiclass_auc = "macro"
 )
 }
 \arguments{
@@ -41,6 +44,11 @@ process_model(
 
 \item{event_class}{For binary classification, specifies which class is considered the positive class:
 `"first"` or `"second"`.}
+
+\item{class_threshold}{For binary classification, controls how class probabilities
+are converted into hard class predictions. Numeric values in (0, 1) set a
+fixed threshold. The default `"auto"` tunes a threshold on the training data
+to maximize F1; use `"model"` to keep the model's default threshold.}
 
 \item{start_col}{Optional string. The name of the column specifying the
 start time in counting process (e.g., `(start, stop, event)`) survival
@@ -78,6 +86,13 @@ resampling to make interval estimates reproducible.}
 proportion of subjects required to remain at risk when determining the
 maximum follow-up time used in survival metrics.}
 
+\item{survival_metric_convention}{Character string specifying which survival
+metric conventions to follow. `"fastml"` (default) uses fastml's internal
+defaults for evaluation horizons and t_max. `"tidymodels"` uses
+`eval_times_user` as the explicit evaluation grid and applies
+yardstick-style Brier/IBS normalization; when `eval_times_user` is `NULL`,
+time-dependent Brier metrics are omitted.}
+
 \item{metrics}{Optional yardstick metric set (e.g., `yardstick::metric_set(yardstick::rmse)`) used for computing regression performance.}
 
 \item{summaryFunction}{Optional custom classification metric function passed to
@@ -86,6 +101,11 @@ maximum follow-up time used in survival metrics.}
 \item{precomputed_predictions}{Optional data frame or nested list of
 previously generated predictions (per algorithm/engine) to reuse instead
 of re-predicting; primarily used when combining results across engines.}
+
+\item{multiclass_auc}{For multiclass ROC AUC, the averaging method to use:
+`"macro"` (default, tidymodels) or `"macro_weighted"`. Macro weights each
+class equally, while macro_weighted weights by class prevalence and can
+change model rankings on imbalanced data.}
 }
 \value{
 A list with two elements:
@@ -106,6 +126,8 @@ probabilistic outputs when supported by the modeling engine.
 
 - For classification tasks, performance metrics include accuracy, kappa, sensitivity, specificity, precision,
   F1-score, and ROC AUC (if probabilities are available).
+
+- For multiclass ROC AUC, the estimator is controlled by `multiclass_auc`.
 
 - For regression tasks, RMSE, R-squared, and MAE are returned.
 

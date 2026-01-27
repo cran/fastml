@@ -15,13 +15,16 @@ fastml_compute_holdout_results(
   task,
   metric = NULL,
   event_class,
+  class_threshold = "auto",
   eval_times = NULL,
   bootstrap_ci = TRUE,
   bootstrap_samples = 500,
   bootstrap_seed = 1234,
   at_risk_threshold = 0.1,
+  survival_metric_convention = "fastml",
   precomputed_predictions = NULL,
-  summaryFunction = NULL
+  summaryFunction = NULL,
+  multiclass_auc = "macro"
 )
 }
 \arguments{
@@ -53,6 +56,11 @@ status (e.g., 0 for censored, 1 for event). Only used when
 
 \item{event_class}{A single string. Either "first" or "second" to specify which level of truth to consider as the "event".}
 
+\item{class_threshold}{For binary classification, controls how class probabilities
+are converted into hard class predictions. Numeric values in (0, 1) set a fixed
+threshold. The default `"auto"` tunes a threshold on the training data to maximize
+F1; use `"model"` to keep the model's default threshold.}
+
 \item{eval_times}{Optional numeric vector of evaluation horizons for survival
 metrics. Passed through to \code{process_model}.}
 
@@ -69,12 +77,24 @@ in metric estimation.}
 risk to define \eqn{t_{max}} when computing survival metrics such as the
 integrated Brier score.}
 
+\item{survival_metric_convention}{Character string specifying which survival
+metric conventions to follow. `"fastml"` (default) uses fastml's internal
+defaults for evaluation horizons and t_max. `"tidymodels"` uses
+`eval_times` as the explicit evaluation grid and applies yardstick-style
+Brier/IBS normalization; when `eval_times` is `NULL`, time-dependent Brier
+metrics are omitted.}
+
 \item{precomputed_predictions}{Optional data frame or nested list of
 previously generated predictions (per algorithm/engine) to reuse instead
 of recomputing. This is mainly used when combining results across engines.}
 
 \item{summaryFunction}{Optional custom classification metric function passed
 through to \code{process_model} for holdout evaluation.}
+
+\item{multiclass_auc}{For multiclass ROC AUC, the averaging method to use:
+`"macro"` (default, tidymodels) or `"macro_weighted"`. Macro weights each
+class equally, while macro_weighted weights by class prevalence and can
+change model rankings on imbalanced data.}
 }
 \value{
 A list with two elements:

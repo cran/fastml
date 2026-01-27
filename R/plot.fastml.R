@@ -120,7 +120,7 @@ plot.fastml <- function(x,
   }
 
   if (task == "classification") {
-    desired_metrics <- c("accuracy", "f_meas", "kap", "precision", "sens", "spec", "roc_auc")
+    desired_metrics <- c("accuracy", "f_meas", "kap", "precision", "sens", "spec", "roc_auc", "logloss", "brier_score")
   } else if (task == "regression") {
     desired_metrics <- c("rmse", "rsq", "mae")
   } else if (task == "survival") {
@@ -162,7 +162,7 @@ plot.fastml <- function(x,
   }
 
   brier_cols <- grep("^brier_t", colnames(performance_wide), value = TRUE)
-  ascending_metrics <- unique(c("rmse", "mae", "ibs", "logloss", "mse", brier_cols))
+  ascending_metrics <- unique(c("rmse", "mae", "ibs", "logloss", "brier_score", "mse", brier_cols))
   if (main_metric %in% ascending_metrics) {
     performance_wide <- performance_wide[order(performance_wide[[main_metric]], na.last = TRUE), ]
   } else {
@@ -291,13 +291,31 @@ plot.fastml <- function(x,
       }
 
       for (algo in names(pred_list)) {
+        # Check if predictions are nested by engine or flat (single engine)
+        algo_preds <- predictions_list[[algo]]
+
+        if (is.data.frame(algo_preds)) {
+          # Flat structure: single engine, get engine name from best_model_name or engine_names
+          eng <- if (!is.null(best_model_name) && algo %in% names(best_model_name)) {
+            as.character(best_model_name[[algo]])
+          } else if (!is.null(engine_names) && algo %in% names(engine_names)) {
+            as.character(engine_names[[algo]])
+          } else {
+            "default"
+          }
+          engines_to_process <- stats::setNames(list(algo_preds), eng)
+        } else {
+          # Nested structure: multiple engines
+          engines_to_process <- algo_preds
+        }
+
         # Loop over each engine in the current algorithm group
-        for (eng in names(predictions_list[[algo]])) {
+        for (eng in names(engines_to_process)) {
           if(eng == "LiblineaR"){
             warning("Engine 'LiblineaR' does not provide probability predictions; no ROC curve (roc_auc) will be computed.")
 
           }else{
-            df <- predictions_list[[algo]][[eng]]
+            df <- engines_to_process[[eng]]
             if (!is.null(df) && "truth" %in% names(df)) {
               # Get probability columns matching ".pred_"
 
@@ -444,8 +462,17 @@ plot.fastml <- function(x,
           engine <- best_model_name[model]
           name_combined <- paste(model, "(", engine, ")", sep = "")
 
-          if (!is.null(predictions_list[[model]]) && !is.null(predictions_list[[model]][[engine]])) {
-            df_best[[name_combined]] <- predictions_list[[model]][[engine]]
+          model_preds <- predictions_list[[model]]
+          if (!is.null(model_preds)) {
+            if (is.data.frame(model_preds)) {
+              # Flat structure: predictions stored directly as data.frame
+              df_best[[name_combined]] <- model_preds
+            } else if (!is.null(model_preds[[engine]])) {
+              # Nested structure: predictions stored by engine
+              df_best[[name_combined]] <- model_preds[[engine]]
+            } else {
+              cat("\nNo predictions found for", model, "with engine", engine, "\n")
+            }
           } else {
             cat("\nNo predictions found for", model, "with engine", engine, "\n")
           }
@@ -465,6 +492,31 @@ plot.fastml <- function(x,
               cat("Error: Column", pred_col, "not found in model predictions for", model_name, "\n")
               next
             }
+            prob_cols_metric <- setdiff(names(model_predictions), c("truth", "estimate"))
+            prob_cols_metric <- prob_cols_metric[
+              vapply(model_predictions[prob_cols_metric], is.numeric, logical(1))
+            ]
+            prob_info <- fastml_prepare_prob_matrix(model_predictions, prob_cols_metric)
+            calib_label <- NULL
+            if (!is.null(prob_info)) {
+              calib <- fastml_class_calibration_metrics(
+                truth_vec = model_predictions$truth,
+                prob_mat = prob_info$mat,
+                prob_cols = prob_info$cols,
+                event_class = x$event_class
+              )
+              calib_vals <- c(calib$logloss, calib$brier_score, calib$ece)
+              if (any(is.finite(calib_vals))) {
+                calib_label <- paste0(
+                  "Logloss: ",
+                  ifelse(is.finite(calib$logloss), sprintf("%.3f", calib$logloss), "NA"),
+                  ", Brier: ",
+                  ifelse(is.finite(calib$brier_score), sprintf("%.3f", calib$brier_score), "NA"),
+                  ", ECE: ",
+                  ifelse(is.finite(calib$ece), sprintf("%.3f", calib$ece), "NA")
+                )
+              }
+            }
             p_cal <- probably::cal_plot_breaks(
               model_predictions,
               truth    = truth,
@@ -472,7 +524,8 @@ plot.fastml <- function(x,
               event_level = x$event_class
             ) +
               ggplot2::labs(
-                title = paste("Calibration Plot for", model_name)
+                title = paste("Calibration Plot for", model_name),
+                subtitle = calib_label
               )
             print(p_cal)
           }
@@ -498,8 +551,17 @@ plot.fastml <- function(x,
         engine <- best_model_name[model]
         name_combined <- paste(model, "(", engine, ")", sep = "")
 
-        if (!is.null(predictions_list[[model]]) && !is.null(predictions_list[[model]][[engine]])) {
-          df_best[[name_combined]] <- predictions_list[[model]][[engine]]
+        model_preds <- predictions_list[[model]]
+        if (!is.null(model_preds)) {
+          if (is.data.frame(model_preds)) {
+            # Flat structure: predictions stored directly as data.frame
+            df_best[[name_combined]] <- model_preds
+          } else if (!is.null(model_preds[[engine]])) {
+            # Nested structure: predictions stored by engine
+            df_best[[name_combined]] <- model_preds[[engine]]
+          } else {
+            cat("\nNo predictions found for", model, "with engine", engine, "\n")
+          }
         } else {
           cat("\nNo predictions found for", model, "with engine", engine, "\n")
         }
@@ -507,7 +569,7 @@ plot.fastml <- function(x,
 
 
       names_df_best <- unique(unlist(lapply(df_best, names)))
-      if (!is.null(df_best) && "truth" %in% names_df_best && "estimate" %in% names_df_best) {
+      if (!is.null(df_best) && length(df_best) > 0 && "truth" %in% names_df_best && "estimate" %in% names_df_best) {
         df_best_all <- dplyr::bind_rows(df_best, .id = "ModelEngine") %>%
           dplyr::mutate(residual = .data$truth - .data$estimate)
 
