@@ -28,7 +28,7 @@ fastml(
   tune_params = NULL,
   engine_params = list(),
   metric = NULL,
-  class_threshold = "auto",
+  class_threshold = 0.5,
   algorithm_engines = NULL,
   use_parsnip_defaults = FALSE,
   warn_engine_defaults = TRUE,
@@ -90,7 +90,11 @@ Native survival engines (flexsurv/rstpm2/custom xgboost) ignore resampling and w
 are supplied. When the task auto-detects survival and \code{resampling_method} is omitted, it defaults to
 \code{"none"} so native engines continue to run; set it explicitly to enable resampling for parsnip survival fits.}
 
-\item{folds}{An integer specifying the number of folds for cross-validation. Default is \code{10} for methods containing "cv" and \code{25} otherwise.}
+\item{folds}{An integer specifying the number of folds for cross-validation
+(default \code{10} for methods containing "cv", \code{25} otherwise).
+When \code{resampling_method = "boot"}, this controls the number of
+bootstrap resamples.  When \code{resampling_method = "validation_split"},
+the proportion held out for validation is derived as \code{1 - 1/folds}.}
 
 \item{repeats}{Number of times to repeat cross-validation (only applicable for methods like "repeatedcv").}
 
@@ -145,10 +149,11 @@ classification, options include \code{"accuracy"}, \code{"roc_auc"},
 \code{"logloss"}, \code{"brier_score"}, and \code{"ece"} (plus other class metrics).}
 
 \item{class_threshold}{For binary classification, controls how class probabilities
-are converted into hard class predictions during holdout evaluation. Numeric
-values in (0, 1) set a fixed threshold. The default \code{"auto"} tunes a
-threshold on the training data to maximize F1; use \code{"model"} to keep
-the model's default threshold.}
+are converted into hard class predictions during holdout evaluation. The default
+is \code{0.5} (standard threshold). Numeric values in (0, 1) set a fixed threshold.
+Use \code{"auto"} to tune a threshold on training data to maximize F1, or specify
+a metric name (e.g., \code{"sens"}, \code{"spec"}, \code{"youden"}) to optimize
+for that metric. Use \code{"model"} to keep the model's default predictions.}
 
 \item{algorithm_engines}{A named list specifying the engine to use for each algorithm.}
 

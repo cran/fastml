@@ -7,7 +7,12 @@
 flatten_and_rename_models(models)
 }
 \arguments{
-\item{models}{A named list of model objects, optionally nested by engine.}
+\item{models}{A named list of model objects or nested named lists of model
+objects. Nested entries are flattened and renamed using the pattern
+`algorithm (engine)`.}
+}
+\value{
+A flat named list of model objects.
 }
 \description{
 Flatten and Rename Models

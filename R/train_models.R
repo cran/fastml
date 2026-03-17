@@ -491,6 +491,7 @@ fastml_run_nested_cv <- function(workflow_spec,
                                  seed,
                                  update_params_fn,
                                  multiclass_auc = "macro",
+                                 survival_metric_convention = "fastml",
                                  grid_levels = 3L) {
   if (!inherits(nested_resamples, "rset") ||
       is.null(nested_resamples$inner_resamples)) {
@@ -674,6 +675,44 @@ fastml_run_nested_cv <- function(workflow_spec,
       metric = metric,
       lower_is_better = lower_is_better
     )
+    if (!is.null(final_params) && is.data.frame(final_params) && nrow(final_params) > 0) {
+      param_cols <- names(final_params)
+      best_score <- if (lower_is_better) Inf else -Inf
+      for (oi in seq_along(inner_results)) {
+        entry <- inner_results[[oi]]
+        if (is.null(entry)) next
+        ir_metrics <- tryCatch(
+          tune::collect_metrics(entry, summarize = TRUE),
+          error = function(e) {
+            if (is.data.frame(entry) && all(c(".metric", ".estimate") %in% names(entry))) {
+              entry
+            } else {
+              NULL
+            }
+          }
+        )
+        if (is.null(ir_metrics) || nrow(ir_metrics) == 0) next
+        ir_sub <- ir_metrics[ir_metrics$.metric == metric, , drop = FALSE]
+        if (nrow(ir_sub) == 0) next
+        shared <- intersect(param_cols, names(ir_sub))
+        match_rows <- ir_sub
+        for (pc in shared) {
+          cmp <- match_rows[[pc]] == final_params[[pc]]
+          cmp[is.na(cmp)] <- FALSE
+          match_rows <- match_rows[cmp, , drop = FALSE]
+        }
+        if (nrow(match_rows) > 0) {
+          fold_score <- match_rows$.estimate[1]
+          if (!is.null(fold_score) && length(fold_score) == 1 &&
+              is.finite(fold_score) &&
+              ((lower_is_better && fold_score < best_score) ||
+               (!lower_is_better && fold_score > best_score))) {
+            best_score <- fold_score
+            selected_outer_id <- outer_ids[[oi]]
+          }
+        }
+      }
+    }
   }
 
   if (do_tuning && (is.null(final_params) || !is.data.frame(final_params) || nrow(final_params) == 0)) {
@@ -920,9 +959,10 @@ fastml_collect_tune_resample_summary <- function(tune_results, best_params, task
 #' @param event_class Character string identifying the positive class when computing
 #'   classification metrics ("first" or "second").
 #' @param class_threshold For binary classification, controls how class probabilities
-#'   are converted into hard class predictions during evaluation. Numeric values in
-#'   (0, 1) set a fixed threshold. The default `"auto"` tunes a threshold on the
-#'   training data to maximize F1; use `"model"` to keep the model's default threshold.
+#'   are converted into hard class predictions during evaluation. The default is `0.5`
+#'   (standard threshold). Numeric values in (0, 1) set a fixed threshold. Use `"auto"`
+#'   to tune a threshold on training data to maximize F1; use `"model"` to keep the
+#'   model's default predictions.
 #' @param multiclass_auc For multiclass ROC AUC, the averaging method to use:
 #'   `"macro"` (default, tidymodels) or `"macro_weighted"`. Macro weights each
 #'   class equally, while macro_weighted weights by class prevalence and can
@@ -960,7 +1000,6 @@ fastml_collect_tune_resample_summary <- function(tune_results, best_params, task
 #'   rolling_origin nested_cv
 #' @importFrom recipes all_nominal_predictors all_numeric_predictors all_outcomes all_predictors
 #' @importFrom finetune control_race tune_race_anova
-#' @importFrom rstpm2 stpm2
 #' @return A list of trained model objects.
 #' @export
 train_models <- function(train_data,
@@ -997,7 +1036,7 @@ train_models <- function(train_data,
                          n_cores = 1,
                          verbose = FALSE,
                          event_class = "first",
-                         class_threshold = "auto",
+                         class_threshold = 0.5,
                          start_col = NULL,
                          time_col = NULL,
                          status_col = NULL,
@@ -1009,6 +1048,16 @@ train_models <- function(train_data,
                          store_fold_models = FALSE) {
   survival_metric_convention <- fastml_normalize_survival_convention(survival_metric_convention)
 
+  .fastml_old_seed <- if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE))
+    get(".Random.seed", envir = .GlobalEnv, inherits = FALSE) else NULL
+  .fastml_had_seed <- !is.null(.fastml_old_seed)
+  on.exit({
+    if (.fastml_had_seed) {
+      assign(".Random.seed", .fastml_old_seed, envir = .GlobalEnv)
+    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      rm(".Random.seed", envir = .GlobalEnv)
+    }
+  }, add = TRUE)
   set.seed(seed)
 
   n_cores_val <- fastml_normalize_threads(n_cores)
@@ -1042,6 +1091,7 @@ train_models <- function(train_data,
   ece_metric <- fastml_configured_ece(event_class = event_class)
 
   tuning_strategy <- match.arg(tuning_strategy, c("grid", "bayes", "none"))
+  event_class <- match.arg(event_class, c("first", "second"))
 
   resample_data <- train_data
 
@@ -1049,6 +1099,7 @@ train_models <- function(train_data,
     "cv",
     "repeatedcv",
     "boot",
+    "validation_split",
     "grouped_cv",
     "blocked_cv",
     "rolling_origin",
@@ -1208,6 +1259,18 @@ train_models <- function(train_data,
         splits = resamples_obj,
         method = "boot",
         params = list(times = folds, strata = status_strata)
+      )
+    } else if (resampling_method == "validation_split") {
+      strata_ok <- !is.null(status_strata)
+      resamples_obj <- rsample::validation_split(
+        resample_data,
+        prop = 1 - 1 / folds,
+        strata = if (strata_ok) dplyr::all_of(status_strata) else NULL
+      )
+      resample_plan <- fastml_new_resample_plan(
+        splits = resamples_obj,
+        method = "validation_split",
+        params = list(prop = 1 - 1 / folds, strata = status_strata)
       )
     } else if (resampling_method == "repeatedcv") {
       if (nrow(resample_data) < folds) {
@@ -2569,6 +2632,18 @@ train_models <- function(train_data,
       method = "boot",
       params = list(times = folds, strata = if (task == "classification") label else NULL)
     )
+  } else if (resampling_method == "validation_split") {
+    strata_col <- if (task == "classification") label else NULL
+    resamples_obj <- rsample::validation_split(
+      resample_data,
+      prop = 1 - 1 / folds,
+      strata = if (!is.null(strata_col)) all_of(strata_col) else NULL
+    )
+    resample_plan <- fastml_new_resample_plan(
+      splits = resamples_obj,
+      method = "validation_split",
+      params = list(prop = 1 - 1 / folds, strata = strata_col)
+    )
   } else if (resampling_method == "repeatedcv") {
     n_data <- nrow(resample_data)
     if (n_data < 3) {
@@ -2924,15 +2999,18 @@ train_models <- function(train_data,
     )
     algorithms[algorithms == "multinom_reg"] <- "logistic_reg"
     algorithms <- algorithms[!duplicated(algorithms)]
+  } else if (n_class > 2 && "logistic_reg" %in% algorithms) {
+    algorithms[algorithms == "logistic_reg"] <- "multinom_reg"
+    algorithms <- algorithms[!duplicated(algorithms)]
+    if (!is.null(engine_params[["logistic_reg"]]) &&
+        is.null(engine_params[["multinom_reg"]])) {
+      engine_params[["multinom_reg"]] <- engine_params[["logistic_reg"]]
+    }
   }
 
   for (algo_index in seq_along(algorithms)) {
     algo <- algorithms[[algo_index]]
     set.seed(seed)
-
-    # Assume that get_engine() now may return multiple engine names.
-
-    if(n_class > 2 && algo == "logistic_reg") {algo = "multinom_reg"}
 
     engines <- get_engine(algo, get_default_engine(algo, task))
 
@@ -3156,6 +3234,7 @@ train_models <- function(train_data,
             seed = tuning_seed_base,
             update_params_fn = update_params,
             multiclass_auc = multiclass_auc,
+            survival_metric_convention = survival_metric_convention,
             grid_levels = grid_levels
           )
 
